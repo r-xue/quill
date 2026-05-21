@@ -1,0 +1,42 @@
+# quill.toml.example
+#
+# Project-level configuration. Safe to commit to version control.
+# Copy to ./quill.toml and edit for your project.
+#
+# Precedence (highest wins):
+#   1. Environment variables   (QUILL_*)
+#   2. ./quill.toml           ← this file
+#   3. ./.env                   (secrets, git-ignored)
+#   4. ~/.quill/config.toml   (user defaults)
+#   5. Package defaults
+
+# ── Jira ────────────────────────────────────────────────────────────────
+jira_server = "https://jira.example.com"
+# jira_token — set in .env or QUILL_JIRA_TOKEN, not here
+jira_verify_ssl = true
+jira_default_issue_type = "Task"
+jira_github_link_field = "customfield_10200"   # custom field for GitHub URL
+
+# ── Sync behaviour ─────────────────────────────────────────────────────
+dry_run = false
+batch_size = 50
+
+# ── Repositories ───────────────────────────────────────────────────────
+[[repos]]
+owner = "your-org"
+repo = "your-repo"
+jira_project = "PROJ"
+sync_labels = true
+sync_comments = true
+
+[repos.issue_filter]
+state = "open"                # "open" | "closed" | "all"
+labels = []                   # only sync issues with these labels; [] = all
+since = "2024-01-01"          # ISO date — initial backfill cutoff
+
+[[repos]]
+owner = "your-org"
+repo = "another-repo"
+jira_project = "OTHER"
+sync_labels = true
+sync_comments = true
