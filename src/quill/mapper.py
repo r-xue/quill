@@ -12,7 +12,7 @@ _HASH_PATTERN = re.compile(r"<!-- quill:sha256:([a-f0-9]+) -->")
 
 # Bump this when the Jira ticket format changes (e.g. new summary format,
 # new description layout) to force re-sync of all existing tickets.
-_QUILL_FORMAT_VERSION = "9"  # v9: support milestone syncing (labels, metadata panel, due date)
+_QUILL_FORMAT_VERSION = "10"  # v10: embed content hash comment in description for zero-cost lookup
 
 
 def compute_content_hash(title: str, body: str, state: str, labels: list[str]) -> str:
@@ -29,12 +29,11 @@ def compute_content_hash(title: str, body: str, state: str, labels: list[str]) -
 
 def embed_hash_footer(description: str, content_hash: str) -> str:
     """
-    Legacy: previously appended the hash as an HTML comment to the description.
-    Now a no-op — the hash is stored invisibly via Jira entity properties.
-    Kept for backward compatibility (old code paths that call this still work).
+    Embed the content hash as an invisible HTML comment at the end of the
+    Jira description. This allows fast zero-HTTP-cost lookup when syncing.
     """
-    # Strip any legacy footer that may exist from older versions of quill
-    return _HASH_PATTERN.sub("", description).rstrip()
+    cleaned = _HASH_PATTERN.sub("", description).rstrip()
+    return f"{cleaned}\n\n<!-- quill:sha256:{content_hash} -->"
 
 
 def extract_hash_footer(description: str) -> str | None:

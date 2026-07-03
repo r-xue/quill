@@ -1,3 +1,4 @@
+import concurrent.futures
 import re
 from typing import Optional, Any
 from rich.console import Console
@@ -68,9 +69,54 @@ class SyncEngine:
                 "all tickets will be updated ***[/bold yellow]"
             )
 
+        # Pre-fetch Jira lookups once per project so repos sharing the same
+        # Jira project (e.g. all 12 repos → "GITHUB") don't repeat the
+        # expensive JQL query.  The lookup maps GitHub URL → Jira issue.
+        github_link_field = self.config.jira_github_link_field
+        project_lookup_cache: dict[str, dict[str, Any]] = {}
+        if not dry_run:
+            projects_needed = {rc.jira_project for rc in repos}
+            for project in projects_needed:
+                logger.info(f"Pre-fetching Jira lookup for project {project}…")
+                project_lookup_cache[project] = self.jira_client.get_synced_issues(
+                    project=project,
+                    github_link_field=github_link_field,
+                )
+                logger.info(
+                    f"Cached {len(project_lookup_cache[project])} synced issues for {project}"
+                )
+
+        # Pre-fetch GitHub issues across all repos in parallel (max 4 concurrent)
+        # to eliminate sequential network wait time across multiple repos.
+        gh_data_cache: dict[str, tuple[list[Any], Optional[dict[int, dict[str, str]]]]] = {}
+        if len(repos) > 1:
+            logger.info(f"Pre-fetching GitHub issues for {len(repos)} repositories in parallel…")
+            def _fetch_gh(rc: GitHubRepoConfig):
+                p_fields = None
+                if rc.sync_project_fields:
+                    p_fields = self.gh_client.get_repo_project_fields(rc.owner, rc.repo)
+                iss = self.gh_client.get_issues(
+                    owner=rc.owner,
+                    repo_name=rc.repo,
+                    since=rc.issue_filter.since,
+                    state=rc.issue_filter.state,
+                    labels=rc.issue_filter.labels or None,
+                )
+                return rc.full_name, (iss, p_fields)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(repos))) as executor:
+                for full_name, data in executor.map(_fetch_gh, repos):
+                    gh_data_cache[full_name] = data
+
         for repo_config in repos:
             try:
-                self._sync_repo(repo_config, dry_run=dry_run, force=force)
+                self._sync_repo(
+                    repo_config,
+                    dry_run=dry_run,
+                    force=force,
+                    project_lookup_cache=project_lookup_cache,
+                    pre_fetched_gh_data=gh_data_cache.get(repo_config.full_name),
+                )
             except Exception:
                 logger.exception(
                     f"Failed to sync repository {repo_config.full_name}"
@@ -78,30 +124,73 @@ class SyncEngine:
 
     # ── Per-repo sync ─────────────────────────────────────────────────────
 
-    def _sync_repo(self, rc: GitHubRepoConfig, dry_run: bool = False, force: bool = False):
+    def _sync_repo(
+        self,
+        rc: GitHubRepoConfig,
+        dry_run: bool = False,
+        force: bool = False,
+        project_lookup_cache: Optional[dict[str, dict[str, Any]]] = None,
+        pre_fetched_gh_data: Optional[tuple[list[Any], Optional[dict[int, dict[str, str]]]]] = None,
+    ):
         logger.info(
             f"[bold blue]Syncing {rc.full_name} → Jira {rc.jira_project}[/bold blue]"
         )
 
-        github_link_field = self.config.jira_github_link_field
-
-        # Step 1 — batch-query Jira for already-synced issues
+        # Step 1 — use cached Jira lookup (fetched once per project in sync_all)
         if not dry_run:
-            existing_lookup = self.jira_client.get_synced_issues(
-                project=rc.jira_project,
-                github_link_field=github_link_field,
-            )
+            if project_lookup_cache and rc.jira_project in project_lookup_cache:
+                existing_lookup = project_lookup_cache[rc.jira_project]
+            else:
+                # Direct call fallback (e.g. when _sync_repo is called standalone)
+                github_link_field = self.config.jira_github_link_field
+                existing_lookup = self.jira_client.get_synced_issues(
+                    project=rc.jira_project,
+                    github_link_field=github_link_field,
+                )
         else:
             existing_lookup = {}
 
-        # Step 2 — fetch GitHub issues
-        gh_issues = self.gh_client.get_issues(
-            owner=rc.owner,
-            repo_name=rc.repo,
-            since=rc.issue_filter.since,
-            state=rc.issue_filter.state,
-            labels=rc.issue_filter.labels or None,
-        )
+        # Step 1.5 — zero-cost description hash check + batch pre-fetch fallback
+        if not dry_run and existing_lookup:
+            unresolved_keys = []
+            for iss in existing_lookup.values():
+                if getattr(iss, "_quill_cached_hash", None) is not None:
+                    continue
+                desc = getattr(getattr(iss, "fields", None), "description", "") or ""
+                footer_hash = extract_hash_footer(desc)
+                if footer_hash:
+                    setattr(iss, "_quill_cached_hash", footer_hash)
+                else:
+                    unresolved_keys.append(iss.key)
+
+            if unresolved_keys:
+                logger.debug(
+                    f"Description hash missed for {len(unresolved_keys)} issues; "
+                    f"batch fetching properties…"
+                )
+                cached_hashes = self.jira_client.batch_get_issue_properties(
+                    unresolved_keys, "quill-content-hash"
+                )
+                for iss in existing_lookup.values():
+                    if iss.key in cached_hashes:
+                        setattr(iss, "_quill_cached_hash", cached_hashes[iss.key])
+
+        # Step 1.8 & Step 2 — fetch or use pre-fetched GitHub issues and custom fields
+        if pre_fetched_gh_data is not None:
+            gh_issues, repo_project_fields = pre_fetched_gh_data
+        else:
+            repo_project_fields = None
+            if rc.sync_project_fields:
+                logger.info("Batch fetching GitHub Projects V2 custom fields via GraphQL…")
+                repo_project_fields = self.gh_client.get_repo_project_fields(rc.owner, rc.repo)
+
+            gh_issues = self.gh_client.get_issues(
+                owner=rc.owner,
+                repo_name=rc.repo,
+                since=rc.issue_filter.since,
+                state=rc.issue_filter.state,
+                labels=rc.issue_filter.labels or None,
+            )
 
         stats = {
             "created": 0,
@@ -113,7 +202,15 @@ class SyncEngine:
 
         for issue in gh_issues:
             try:
-                self._sync_issue(rc, issue, existing_lookup, dry_run, force, stats)
+                self._sync_issue(
+                    rc,
+                    issue,
+                    existing_lookup,
+                    dry_run,
+                    force,
+                    stats,
+                    repo_project_fields=repo_project_fields,
+                )
             except Exception as exc:
                 stats["errors"] += 1
                 logger.error(
@@ -137,13 +234,17 @@ class SyncEngine:
         dry_run: bool,
         force: bool,
         stats: dict[str, int],
+        repo_project_fields: Optional[dict[int, dict[str, str]]] = None,
     ):
         gh_url: str = issue.html_url
         issue_labels = [label.name for label in issue.labels]
 
         project_fields: dict[str, str] = {}
         if rc.sync_project_fields:
-            project_fields = self.gh_client.get_issue_project_fields(issue)
+            if repo_project_fields is not None and issue.number in repo_project_fields:
+                project_fields = repo_project_fields[issue.number]
+            else:
+                project_fields = self.gh_client.get_issue_project_fields(issue)
             for k, v in sorted(project_fields.items()):
                 clean_k = re.sub(r"[^a-zA-Z0-9]+", "-", k.lower()).strip("-")
                 clean_v = re.sub(r"[^a-zA-Z0-9]+", "-", v.lower()).strip("-")
@@ -277,16 +378,21 @@ class SyncEngine:
             # ── EXISTS — check for changes ─────────────────────────────────
             jira_key = jira_issue.key
 
-            # Primary: read hash from invisible entity property
-            existing_hash = self.jira_client.get_issue_property(
-                jira_key, "quill-content-hash"
-            )
-            # Fallback: migrate legacy tickets that stored the hash in the
-            # description footer (quill < property-based hash version)
+            # Primary: read hash from pre-fetched cache or description comment (zero HTTP cost)
+            existing_hash = getattr(jira_issue, "_quill_cached_hash", None)
             if existing_hash is None:
                 existing_hash = extract_hash_footer(
                     getattr(jira_issue.fields, "description", "") or ""
                 )
+                if existing_hash is not None:
+                    setattr(jira_issue, "_quill_cached_hash", existing_hash)
+            # Fallback: query Jira entity property
+            if existing_hash is None:
+                existing_hash = self.jira_client.get_issue_property(
+                    jira_key, "quill-content-hash"
+                )
+                if existing_hash is not None:
+                    setattr(jira_issue, "_quill_cached_hash", existing_hash)
 
             # --force: ignore stored hash and always update
             if force:
@@ -349,7 +455,7 @@ class SyncEngine:
                     )
 
         # ── Comment sync ─────────────────────────────────────────────
-        if rc.sync_comments:
+        if rc.sync_comments and getattr(issue, "comments", 0) > 0:
             if jira_key:
                 self._sync_comments(rc, issue, jira_key, dry_run, stats)
             elif dry_run:

@@ -101,6 +101,125 @@ class GitHubClient:
         comments = issue.get_comments(**kwargs)
         return list(comments)
 
+    def get_repo_project_fields(self, owner: str, repo_name: str) -> dict[int, dict[str, str]]:
+        """Fetch custom fields from GitHub Projects V2 for all issues in a repo via batch GraphQL.
+
+        Returns:
+            A dictionary mapping issue number to field dictionary (e.g., {48: {'Priority': 'High'}}).
+        """
+        if not self.token:
+            return {}
+
+        query = """
+        query($owner: String!, $name: String!, $cursor: String) {
+          repository(owner: $owner, name: $name) {
+            issues(first: 100, after: $cursor) {
+              pageInfo {
+                hasNextPage
+                endCursor
+              }
+              nodes {
+                number
+                projectItems(first: 10) {
+                  nodes {
+                    fieldValues(first: 20) {
+                      nodes {
+                        ... on ProjectV2ItemFieldTextValue {
+                          text
+                          field { ... on ProjectV2FieldCommon { name } }
+                        }
+                        ... on ProjectV2ItemFieldNumberValue {
+                          number
+                          field { ... on ProjectV2FieldCommon { name } }
+                        }
+                        ... on ProjectV2ItemFieldDateValue {
+                          date
+                          field { ... on ProjectV2FieldCommon { name } }
+                        }
+                        ... on ProjectV2ItemFieldSingleSelectValue {
+                          name
+                          field { ... on ProjectV2FieldCommon { name } }
+                        }
+                        ... on ProjectV2ItemFieldIterationValue {
+                          title
+                          field { ... on ProjectV2FieldCommon { name } }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        """
+
+        results: dict[int, dict[str, str]] = {}
+        cursor = None
+        has_next_page = True
+
+        try:
+            while has_next_page:
+                variables = {"owner": owner, "name": repo_name, "cursor": cursor}
+                req = urllib.request.Request(
+                    "https://api.github.com/graphql",
+                    data=json.dumps({"query": query, "variables": variables}).encode("utf-8"),
+                    headers={
+                        "Authorization": f"Bearer {self.token}",
+                        "Content-Type": "application/json",
+                        "User-Agent": "quill",
+                    },
+                )
+                with urllib.request.urlopen(req) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+
+                issues_data = data.get("data", {}).get("repository", {}).get("issues", {})
+                nodes = issues_data.get("nodes", []) or []
+                for issue_node in nodes:
+                    if not issue_node:
+                        continue
+                    issue_num = issue_node.get("number")
+                    if not issue_num:
+                        continue
+
+                    fields_map: dict[str, str] = {}
+                    items = issue_node.get("projectItems", {}).get("nodes", []) or []
+                    for item in items:
+                        if not item:
+                            continue
+                        field_vals = item.get("fieldValues", {}).get("nodes", []) or []
+                        for fv in field_vals:
+                            if not fv:
+                                continue
+                            field_meta = fv.get("field") or {}
+                            field_name = field_meta.get("name")
+                            if not field_name or field_name.lower() in ("title",):
+                                continue
+
+                            val = (
+                                fv.get("text")
+                                or fv.get("name")
+                                or fv.get("date")
+                                or fv.get("title")
+                            )
+                            if val is None and "number" in fv and fv["number"] is not None:
+                                val = str(fv["number"])
+
+                            if val:
+                                fields_map[field_name] = str(val)
+
+                    if fields_map:
+                        results[issue_num] = fields_map
+
+                page_info = issues_data.get("pageInfo", {})
+                has_next_page = page_info.get("hasNextPage", False)
+                cursor = page_info.get("endCursor")
+
+            return results
+        except Exception as exc:
+            logger.warning(f"Failed to batch fetch repo project fields via GraphQL: {exc}")
+            return {}
+
     def get_issue_project_fields(self, issue: Any) -> dict[str, str]:
         """Fetch custom fields from GitHub Projects V2 for the given issue via GraphQL.
 
