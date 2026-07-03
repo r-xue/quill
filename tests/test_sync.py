@@ -81,5 +81,82 @@ class TestJiraClientEmptyField:
             mock_jira_inst.search_issues.assert_called_once()
             called_jql = mock_jira_inst.search_issues.call_args[0][0]
             assert 'labels = "github-synced"' in called_jql
+            assert mock_jira_inst.search_issues.call_args[1]["fields"] == "summary,description,status"
             assert lookup == {"https://github.com/your-org/your-repo/issues/1": mock_issue}
+
+
+class TestClosedIssueSync:
+    @patch("quill.sync.compute_content_hash", return_value="hash123")
+    def test_sync_closed_issue_without_status_attribute(self, mock_hash, v2_config):
+        """Ensure syncing a closed issue doesn't crash if jira_issue.fields has no status attribute."""
+        engine = SyncEngine(v2_config)
+        
+        mock_gh_issue = MagicMock()
+        mock_gh_issue.number = 1
+        mock_gh_issue.html_url = "https://github.com/your-org/your-repo/issues/1"
+        mock_gh_issue.labels = []
+        mock_gh_issue.state = "closed"
+        mock_gh_issue.title = "Closed Issue"
+        mock_gh_issue.body = "Body"
+
+        # Create a mock Jira issue whose fields object explicitly lacks a 'status' attribute
+        # simulating a PropertyHolder without status.
+        class FakeFields:
+            summary = "[your-repo#1] Closed Issue"
+            description = "Body"
+
+        mock_jira_issue = MagicMock()
+        mock_jira_issue.key = "CAS-1"
+        mock_jira_issue.fields = FakeFields()
+
+        engine.jira_client.get_issue_property.return_value = "hash123"
+        stats = {"created": 0, "updated": 0, "skipped": 0, "comments": 0, "errors": 0}
+
+        # Should not raise AttributeError: 'FakeFields' object has no attribute 'status'
+        engine._sync_issue(
+            rc=v2_config.repos[0],
+            issue=mock_gh_issue,
+            lookup={mock_gh_issue.html_url: mock_jira_issue},
+            dry_run=True,
+            force=False,
+            stats=stats,
+        )
+        assert stats["errors"] == 0
+
+
+class TestProjectFieldsSync:
+    def test_sync_project_fields_to_labels_and_panel(self, v2_config):
+        """Verify GitHub Projects V2 fields are converted to structured Jira labels and added to panel."""
+        v2_config.repos[0].sync_project_fields = True
+        engine = SyncEngine(v2_config)
+
+        mock_gh_issue = MagicMock()
+        mock_gh_issue.number = 42
+        mock_gh_issue.html_url = "https://github.com/your-org/your-repo/issues/42"
+        mock_gh_issue.labels = []
+        mock_gh_issue.state = "open"
+        mock_gh_issue.title = "Project Issue"
+        mock_gh_issue.body = "Some description"
+
+        with patch.object(
+            engine.gh_client,
+            "get_issue_project_fields",
+            return_value={"Priority": "High", "Team": "Core Infra"},
+        ):
+            with patch.object(engine, "_preview_issue") as mock_preview:
+                stats = {"created": 0, "updated": 0, "skipped": 0, "comments": 0, "errors": 0}
+                engine._sync_issue(
+                    rc=v2_config.repos[0],
+                    issue=mock_gh_issue,
+                    lookup={},
+                    dry_run=True,
+                    force=False,
+                    stats=stats,
+                )
+                assert stats["created"] == 1
+                kwargs = mock_preview.call_args[1]
+                assert "proj-priority-high" in kwargs["labels"]
+                assert "proj-team-core-infra" in kwargs["labels"]
+                assert "*Project:* *Priority:* High \\| *Team:* Core Infra" in kwargs["description"]
+
 

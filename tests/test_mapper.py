@@ -35,6 +35,11 @@ class TestMarkdownToJira:
     def test_unordered_list(self):
         assert markdown_to_jira("- item 1\n- item 2") == "* item 1\n* item 2"
 
+    def test_asterisk_bullet_list_not_converted_to_italic(self):
+        md = "* Expertise with radio astronomy\n* Experience with building workflows"
+        expected = "* Expertise with radio astronomy\n* Experience with building workflows"
+        assert markdown_to_jira(md) == expected
+
     def test_ordered_list(self):
         assert markdown_to_jira("1. first\n2. second") == "# first\n# second"
 

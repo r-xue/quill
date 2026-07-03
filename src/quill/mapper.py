@@ -12,7 +12,7 @@ _HASH_PATTERN = re.compile(r"<!-- quill:sha256:([a-f0-9]+) -->")
 
 # Bump this when the Jira ticket format changes (e.g. new summary format,
 # new description layout) to force re-sync of all existing tickets.
-_QUILL_FORMAT_VERSION = "7"  # v7: panel with bgColor, no title bar
+_QUILL_FORMAT_VERSION = "8"  # v8: fix markdown list/italic regex order and line span
 
 
 def compute_content_hash(title: str, body: str, state: str, labels: list[str]) -> str:
@@ -87,34 +87,34 @@ def markdown_to_jira(markdown_text: str) -> str:
 
     text = re.sub(r"^(#{1,6})\s+(.+)$", _replace_header, text, flags=re.MULTILINE)
 
-    # 4. Bold: **bold** or __bold__ → placeholder
+    # 4. Unordered lists: - item or * item → * item
+    text = re.sub(r"^\s*[-*]\s+(.+)$", r"* \1", text, flags=re.MULTILINE)
+
+    # 5. Ordered lists: 1. item → # item
+    text = re.sub(r"^\s*\d+\.\s+(.+)$", r"# \1", text, flags=re.MULTILINE)
+
+    # 6. Blockquotes: > text → {quote}text{quote}
+    text = re.sub(r"^>\s+(.+)$", r"{quote}\1{quote}", text, flags=re.MULTILINE)
+
+    # 7. Links: [text](url) → [text|url]
+    text = re.sub(r"\[([^\]\n]+)\]\(([^)\n]+)\)", r"[\1|\2]", text)
+
+    # 8. Bold: **bold** or __bold__ → placeholder
     text = re.sub(
-        r"\*\*([^*]+)\*\*|__([^_]+)__",
+        r"\*\*(?!\s)([^\n*]+?)(?<!\s)\*\*|__(?!\s)([^\n_]+?)(?<!\s)__",
         lambda m: f"\x00{m.group(1) or m.group(2)}\x00",
         text,
     )
 
-    # 5. Italic: *italic* or _italic_ → _italic_
+    # 9. Italic: *italic* or _italic_ → _italic_
     text = re.sub(
-        r"\*([^*]+)\*|_([^_]+)_",
+        r"\*(?!\s)([^\n*]+?)(?<!\s)\*|_(?!\s)([^\n_]+?)(?<!\s)_",
         lambda m: f"_{m.group(1) or m.group(2)}_",
         text,
     )
 
     # Convert placeholder to * (Jira bold)
     text = text.replace("\x00", "*")
-
-    # 6. Links: [text](url) → [text|url]
-    text = re.sub(r"\[([^\]\n]+)\]\(([^)\n]+)\)", r"[\1|\2]", text)
-
-    # 7. Unordered lists: - item or * item → * item
-    text = re.sub(r"^\s*[-*]\s+(.+)$", r"* \1", text, flags=re.MULTILINE)
-
-    # 8. Ordered lists: 1. item → # item
-    text = re.sub(r"^\s*\d+\.\s+(.+)$", r"# \1", text, flags=re.MULTILINE)
-
-    # 9. Blockquotes: > text → {quote}text{quote}
-    text = re.sub(r"^>\s+(.+)$", r"{quote}\1{quote}", text, flags=re.MULTILINE)
 
     return text
 

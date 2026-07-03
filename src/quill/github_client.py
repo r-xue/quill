@@ -1,3 +1,5 @@
+import json
+import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Optional
 from github import Github
@@ -6,6 +8,7 @@ from quill.log import logger
 
 class GitHubClient:
     def __init__(self, token: Optional[str] = None):
+        self.token = token
         if token:
             self.gh = Github(token)
         else:
@@ -97,3 +100,100 @@ class GitHubClient:
 
         comments = issue.get_comments(**kwargs)
         return list(comments)
+
+    def get_issue_project_fields(self, issue: Any) -> dict[str, str]:
+        """Fetch custom fields from GitHub Projects V2 for the given issue via GraphQL.
+
+        Returns:
+            A mapping from field name to string value (e.g., {'Priority': 'High'}).
+        """
+        if not self.token:
+            return {}
+        node_id = getattr(issue, "node_id", None)
+        if not node_id:
+            return {}
+
+        query = """
+        query($nodeId: ID!) {
+          node(id: $nodeId) {
+            ... on Issue {
+              projectItems(first: 10) {
+                nodes {
+                  fieldValues(first: 20) {
+                    nodes {
+                      ... on ProjectV2ItemFieldTextValue {
+                        text
+                        field { ... on ProjectV2FieldCommon { name } }
+                      }
+                      ... on ProjectV2ItemFieldNumberValue {
+                        number
+                        field { ... on ProjectV2FieldCommon { name } }
+                      }
+                      ... on ProjectV2ItemFieldDateValue {
+                        date
+                        field { ... on ProjectV2FieldCommon { name } }
+                      }
+                      ... on ProjectV2ItemFieldSingleSelectValue {
+                        name
+                        field { ... on ProjectV2FieldCommon { name } }
+                      }
+                      ... on ProjectV2ItemFieldIterationValue {
+                        title
+                        field { ... on ProjectV2FieldCommon { name } }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        """
+
+        try:
+            req = urllib.request.Request(
+                "https://api.github.com/graphql",
+                data=json.dumps({"query": query, "variables": {"nodeId": node_id}}).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {self.token}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "quill",
+                },
+            )
+            with urllib.request.urlopen(req) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+
+            node = data.get("data", {}).get("node", {})
+            if not node:
+                return {}
+
+            project_fields: dict[str, str] = {}
+            items = node.get("projectItems", {}).get("nodes", []) or []
+            for item in items:
+                if not item:
+                    continue
+                field_vals = item.get("fieldValues", {}).get("nodes", []) or []
+                for fv in field_vals:
+                    if not fv:
+                        continue
+                    field_meta = fv.get("field") or {}
+                    field_name = field_meta.get("name")
+                    if not field_name or field_name.lower() in ("title",):
+                        continue
+
+                    val = (
+                        fv.get("text")
+                        or fv.get("name")
+                        or fv.get("date")
+                        or fv.get("title")
+                    )
+                    if val is None and "number" in fv and fv["number"] is not None:
+                        val = str(fv["number"])
+
+                    if val:
+                        project_fields[field_name] = str(val)
+
+            return project_fields
+        except Exception as exc:
+            logger.debug(f"Failed to fetch GraphQL project fields for #{getattr(issue, 'number', '?')}: {exc}")
+            return {}

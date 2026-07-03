@@ -28,6 +28,7 @@ repo = "your-repo"
 jira_project = "PROJ"
 sync_labels = true
 sync_comments = true
+sync_project_fields = false    # sync GitHub Projects V2 custom fields as Jira labels (proj-key-val)
 
 [repos.issue_filter]
 state = "open"                # "open" | "closed" | "all"
