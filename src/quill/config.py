@@ -59,6 +59,7 @@ class GitHubRepoConfig(BaseModel):
     sync_labels: bool = True
     sync_comments: bool = True
     sync_project_fields: bool = False
+    sync_milestones: bool = True
     issue_filter: GitHubIssueFilter = Field(default_factory=GitHubIssueFilter)
 
     @property

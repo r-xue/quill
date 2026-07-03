@@ -144,6 +144,7 @@ class JiraClient:
         labels: Optional[list[str]] = None,
         github_link_field: Optional[str] = None,
         github_url: Optional[str] = None,
+        due_date: Optional[str] = None,
     ) -> str:
         """Create a new issue in Jira.
 
@@ -158,6 +159,7 @@ class JiraClient:
             labels: A list of labels to apply to the issue.
             github_link_field: The custom field ID for storing the GitHub URL.
             github_url: The actual GitHub URL to store.
+            due_date: Optional due date string in YYYY-MM-DD format.
 
         Returns:
             The newly created issue key.
@@ -179,6 +181,9 @@ class JiraClient:
         # Set the custom field via edit (bypasses create-screen restrictions)
         if github_link_field and github_url:
             self.set_custom_field(key, github_link_field, github_url)
+
+        if due_date:
+            self.set_due_date(key, due_date)
 
         return key
 
@@ -202,12 +207,25 @@ class JiraClient:
                 f"JQL deduplication will fall back to summary matching."
             )
 
+    def set_due_date(self, issue_key: str, due_date: str):
+        """Set the due date on a Jira issue safely via the edit endpoint."""
+        logger.info(f"Setting duedate ({due_date}) on {issue_key}…")
+        try:
+            issue = self.jira.issue(issue_key)
+            issue.update(fields={"duedate": due_date})
+        except Exception as exc:
+            logger.warning(
+                f"Could not set duedate on {issue_key}: {exc}. "
+                f"Ensure the Due Date field is enabled on the edit screen."
+            )
+
     def update_issue(
         self,
         issue_key: str,
         summary: str,
         description: str,
         labels: Optional[list[str]] = None,
+        due_date: Optional[str] = None,
     ):
         """
         Update an existing Jira issue's summary, description, and labels.
@@ -222,6 +240,9 @@ class JiraClient:
         logger.info(f"Updating Jira issue {issue_key}…")
         issue = self.jira.issue(issue_key)
         issue.update(fields=fields)
+
+        if due_date:
+            self.set_due_date(issue_key, due_date)
 
     # ── Comments ──────────────────────────────────────────────────────────
 
