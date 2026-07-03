@@ -1,5 +1,6 @@
 import warnings
 import requests
+import concurrent.futures
 from typing import Optional, Any
 from jira import JIRA
 from quill.log import logger
@@ -87,19 +88,32 @@ class JiraClient:
             return {}
 
         lookup = {}
+        unresolved_issues = []  # issues where description parsing didn't find a URL
         for issue in issues:
             summary = getattr(issue.fields, "summary", "") or ""
-            # Primary: read GitHub URL from entity property (quill >= v4)
-            gh_url = self.get_issue_property(issue.key, "quill-github-url")
-            # Legacy fallback: parse from description footer (quill < v4)
-            if not gh_url:
-                description = getattr(issue.fields, "description", "") or ""
-                gh_url = _extract_github_url(description)
+            # Primary: extract GitHub URL from description text (zero HTTP cost)
+            description = getattr(issue.fields, "description", "") or ""
+            gh_url = _extract_github_url(description)
             if gh_url:
                 lookup[gh_url] = issue
             else:
-                # No URL found — key by summary for per-issue fallback match
-                lookup[f"__summary__{summary}"] = issue
+                unresolved_issues.append((issue, summary))
+
+        # Secondary: batch-fetch entity properties only for unresolved issues
+        if unresolved_issues:
+            unresolved_keys = [iss.key for iss, _ in unresolved_issues]
+            logger.debug(
+                f"Description parsing missed {len(unresolved_keys)} issues; "
+                f"batch-fetching quill-github-url properties…"
+            )
+            url_map = self.batch_get_issue_properties(unresolved_keys, "quill-github-url")
+            for issue, summary in unresolved_issues:
+                gh_url = url_map.get(issue.key)
+                if gh_url:
+                    lookup[gh_url] = issue
+                else:
+                    # No URL found — key by summary for per-issue fallback match
+                    lookup[f"__summary__{summary}"] = issue
         return lookup
 
     def find_by_summary_prefix(self, project: str, prefix: str) -> Any:
@@ -302,6 +316,28 @@ class JiraClient:
         except Exception as exc:
             logger.debug(f"set_issue_property failed for {issue_key}: {exc}")
 
+    def batch_get_issue_properties(self, issue_keys: list[str], property_key: str) -> dict[str, Any]:
+        """Fetch an entity property for multiple issues in parallel using a polite read-only thread pool."""
+        if not issue_keys:
+            return {}
+        results: dict[str, Any] = {}
+        # GitHub standard runners (ubuntu-latest) have 2 vCPUs. Using max_workers=4 is gentle on
+        # network firewalls while still providing a 4x I/O speedup over serial requests.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(issue_keys))) as executor:
+            future_to_key = {
+                executor.submit(self.get_issue_property, key, property_key): key
+                for key in issue_keys
+            }
+            for future in concurrent.futures.as_completed(future_to_key):
+                key = future_to_key[future]
+                try:
+                    val = future.result()
+                    if val is not None:
+                        results[key] = val
+                except Exception:
+                    pass
+        return results
+
     # ── Remote links ──────────────────────────────────────────────────────
 
     def add_remote_link(
@@ -374,15 +410,29 @@ def _cf_id(field_name: str) -> str:
 
 def _extract_github_url(description: str) -> str | None:
     """
-    Extract the GitHub issue URL from the footer line quill writes into
-    every Jira description::
+    Extract the GitHub issue URL from the Jira description.
+
+    Supports two formats written by different quill versions:
+
+    Modern (v5+) — panel header::
+
+        *Source:* [owner/repo#N|https://github.com/owner/repo/issues/N]
+
+    Legacy (< v5) — description footer::
 
         _Originally filed on GitHub:_ [owner/repo#N|https://github.com/...]
 
     Returns the URL string or None if not found.
     """
     import re
-    # Match the Jira wiki link format: [text|url]
+    # Modern panel header: *Source:* [text|url]
+    match = re.search(
+        r"\*Source:\*\s*\[.*?\|(https://github\.com/[^\]]+)\]",
+        description,
+    )
+    if match:
+        return match.group(1)
+    # Legacy footer: _Originally filed on GitHub:_ [text|url]
     match = re.search(
         r"Originally filed on GitHub.*?\[.*?\|(https://github\.com/[^\]]+)\]",
         description,
