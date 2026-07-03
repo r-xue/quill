@@ -12,7 +12,7 @@ _HASH_PATTERN = re.compile(r"<!-- quill:sha256:([a-f0-9]+) -->")
 
 # Bump this when the Jira ticket format changes (e.g. new summary format,
 # new description layout) to force re-sync of all existing tickets.
-_QUILL_FORMAT_VERSION = "8"  # v8: fix markdown list/italic regex order and line span
+_QUILL_FORMAT_VERSION = "9"  # v9: support milestone syncing (labels, metadata panel, due date)
 
 
 def compute_content_hash(title: str, body: str, state: str, labels: list[str]) -> str:

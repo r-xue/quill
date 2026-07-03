@@ -150,6 +150,27 @@ class SyncEngine:
                 if clean_k and clean_v:
                     issue_labels.append(f"proj-{clean_k}-{clean_v}")
 
+        # Option 1 & 3: Extract Milestone title and due date
+        milestone_title = None
+        due_date_str = None
+        if getattr(rc, "sync_milestones", True):
+            milestone_obj = getattr(issue, "milestone", None)
+            if milestone_obj:
+                milestone_title = getattr(milestone_obj, "title", None)
+                due_on = getattr(milestone_obj, "due_on", None)
+                if due_on:
+                    if hasattr(due_on, "strftime"):
+                        due_date_str = due_on.strftime("%Y-%m-%d")
+                    else:
+                        due_date_str = str(due_on)[:10]
+
+                if milestone_title:
+                    clean_ms = re.sub(
+                        r"[^a-zA-Z0-9]+", "-", milestone_title.lower()
+                    ).strip("-")
+                    if clean_ms:
+                        issue_labels.append(f"milestone-{clean_ms}")
+
         current_hash = compute_content_hash(
             issue.title, issue.body, issue.state, issue_labels
         )
@@ -163,12 +184,22 @@ class SyncEngine:
         author_login = issue.user.login if issue.user else "unknown"
         author_url = f"https://github.com/{author_login}"
 
-        proj_line = ""
+        proj_parts = []
+        if milestone_title:
+            ms_display = f"*{milestone_title}*"
+            if due_date_str:
+                ms_display += f" (Due: {due_date_str})"
+            proj_parts.append(f"*Milestone:* {ms_display}")
+
         if project_fields:
             formatted_fields = " \\| ".join(
                 f"*{k}:* {v}" for k, v in sorted(project_fields.items())
             )
-            proj_line = f"*Project:* {formatted_fields}\n"
+            proj_parts.append(f"*Project:* {formatted_fields}")
+
+        proj_line = ""
+        if proj_parts:
+            proj_line = " \\| ".join(proj_parts) + "\n"
 
         header = (
             f"{{panel:borderStyle=solid|borderColor=#ccc|bgColor=#f5f5f5}}\n"
@@ -213,6 +244,7 @@ class SyncEngine:
                     labels=all_labels,
                     github_link_field=github_link_field,
                     github_url=gh_url,
+                    due_date=due_date_str,
                 )
                 self.jira_client.add_remote_link(
                     issue_key=jira_key,
@@ -271,6 +303,7 @@ class SyncEngine:
                         summary=summary,
                         description=jira_description,
                         labels=all_labels,
+                        due_date=due_date_str,
                     )
                     self.jira_client.set_issue_property(
                         jira_key, "quill-content-hash", current_hash
