@@ -100,6 +100,7 @@ These are defined in TOML as `[[repos]]` array-of-tables. They cannot be set via
 | `jira_project` | string | *required* | Jira project key (e.g., `CAS`). |
 | `sync_labels` | bool | `true` | Copy GitHub labels → Jira labels. |
 | `sync_comments` | bool | `true` | Sync comments with attribution. |
+| `sync_project_fields` | bool | `false` | Fetch GitHub Projects V2 custom fields via GraphQL and sync as Jira labels (`proj-key-val`) and description panel. |
 | `issue_filter.state` | string | `"all"` | `"open"`, `"closed"`, or `"all"`. |
 | `issue_filter.labels` | list[str] | `[]` | Filter: only sync issues with these labels. |
 | `issue_filter.since` | string | `null` | ISO date backfill cutoff (e.g., `"2024-01-01"`). |
