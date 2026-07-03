@@ -101,3 +101,19 @@ Every Jira issue created or updated by quill has an invisible JSON property atta
 `quill-content-hash: a1b2c3d4e5f67890...`
 
 This is used for [change detection](architecture.md#change-detection) and is not visible in the Jira UI.
+
+---
+
+## GitHub Projects V2 Custom Fields (`sync_project_fields`)
+
+When `sync_project_fields = true` is enabled for a repository in `quill.toml`, Quill queries the GitHub GraphQL API v4 to extract custom project board attributes (such as `Priority`, `Status`, `Target Date`, `Team`, or `Estimate`) across all linked Projects V2 boards.
+
+To ensure seamless searchability without requiring custom Jira screen schemes or Jira Administrator intervention, Projects V2 fields are mapped in two ways:
+
+1. **Structured Labels**: Each field and value is normalized into lowercase hyphenated labels in the format `proj-<field>-<value>` (e.g., `proj-priority-high`, `proj-team-core-infra`).
+2. **Description Metadata Panel**: All project attributes are aggregated and displayed in the top metadata block of the Jira ticket description:
+   ```text
+   *Project:* *Priority:* High | *Team:* Core Infra | *Target Date:* 2026-Q3
+   ```
+
+Any updates to fields on the GitHub Projects V2 board will automatically update the ticket's content hash and trigger a synchronization run.
