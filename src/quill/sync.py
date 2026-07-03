@@ -1,3 +1,4 @@
+import re
 from typing import Optional, Any
 from rich.console import Console
 from rich.panel import Panel
@@ -139,6 +140,16 @@ class SyncEngine:
     ):
         gh_url: str = issue.html_url
         issue_labels = [label.name for label in issue.labels]
+
+        project_fields: dict[str, str] = {}
+        if rc.sync_project_fields:
+            project_fields = self.gh_client.get_issue_project_fields(issue)
+            for k, v in sorted(project_fields.items()):
+                clean_k = re.sub(r"[^a-zA-Z0-9]+", "-", k.lower()).strip("-")
+                clean_v = re.sub(r"[^a-zA-Z0-9]+", "-", v.lower()).strip("-")
+                if clean_k and clean_v:
+                    issue_labels.append(f"proj-{clean_k}-{clean_v}")
+
         current_hash = compute_content_hash(
             issue.title, issue.body, issue.state, issue_labels
         )
@@ -152,11 +163,19 @@ class SyncEngine:
         author_login = issue.user.login if issue.user else "unknown"
         author_url = f"https://github.com/{author_login}"
 
+        proj_line = ""
+        if project_fields:
+            formatted_fields = " \\| ".join(
+                f"*{k}:* {v}" for k, v in sorted(project_fields.items())
+            )
+            proj_line = f"*Project:* {formatted_fields}\n"
+
         header = (
             f"{{panel:borderStyle=solid|borderColor=#ccc|bgColor=#f5f5f5}}\n"
             f"*Source:* [{rc.full_name}#{issue.number}|{gh_url}] \\| "
             f"*Author:* [{author_login}|{author_url}] \\| "
             f"*Created:* {created_at}\n"
+            f"{proj_line}"
             f"{{panel}}\n\n"
         )
 
@@ -280,7 +299,8 @@ class SyncEngine:
         if issue.state == "closed":
             is_already_closed = False
             if jira_issue is not None:
-                status_name = getattr(jira_issue.fields.status, "name", "").lower()
+                status_obj = getattr(jira_issue.fields, "status", None)
+                status_name = getattr(status_obj, "name", "").lower() if status_obj else ""
                 if status_name in ("done", "closed", "resolved"):
                     is_already_closed = True
 

@@ -80,7 +80,7 @@ class JiraClient:
         logger.info(f"JQL fallback (label-based): {fallback_jql}")
         try:
             issues = self.jira.search_issues(
-                fallback_jql, maxResults=False, fields="summary,description"
+                fallback_jql, maxResults=False, fields="summary,description,status"
             )
         except Exception as exc:
             logger.warning(f"Fallback JQL also failed: {exc}")
@@ -122,7 +122,7 @@ class JiraClient:
         )
         try:
             issues = self.jira.search_issues(
-                jql, maxResults=200, fields="summary,description"
+                jql, maxResults=200, fields="summary,description,status"
             )
             for issue in issues:
                 s = getattr(issue.fields, "summary", "") or ""

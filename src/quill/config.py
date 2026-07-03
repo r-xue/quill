@@ -58,6 +58,7 @@ class GitHubRepoConfig(BaseModel):
     jira_project: str
     sync_labels: bool = True
     sync_comments: bool = True
+    sync_project_fields: bool = False
     issue_filter: GitHubIssueFilter = Field(default_factory=GitHubIssueFilter)
 
     @property
