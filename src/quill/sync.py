@@ -1,3 +1,4 @@
+import concurrent.futures
 import re
 from typing import Optional, Any
 from rich.console import Console
@@ -85,6 +86,28 @@ class SyncEngine:
                     f"Cached {len(project_lookup_cache[project])} synced issues for {project}"
                 )
 
+        # Pre-fetch GitHub issues across all repos in parallel (max 4 concurrent)
+        # to eliminate sequential network wait time across multiple repos.
+        gh_data_cache: dict[str, tuple[list[Any], Optional[dict[int, dict[str, str]]]]] = {}
+        if len(repos) > 1:
+            logger.info(f"Pre-fetching GitHub issues for {len(repos)} repositories in parallel…")
+            def _fetch_gh(rc: GitHubRepoConfig):
+                p_fields = None
+                if rc.sync_project_fields:
+                    p_fields = self.gh_client.get_repo_project_fields(rc.owner, rc.repo)
+                iss = self.gh_client.get_issues(
+                    owner=rc.owner,
+                    repo_name=rc.repo,
+                    since=rc.issue_filter.since,
+                    state=rc.issue_filter.state,
+                    labels=rc.issue_filter.labels or None,
+                )
+                return rc.full_name, (iss, p_fields)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(repos))) as executor:
+                for full_name, data in executor.map(_fetch_gh, repos):
+                    gh_data_cache[full_name] = data
+
         for repo_config in repos:
             try:
                 self._sync_repo(
@@ -92,6 +115,7 @@ class SyncEngine:
                     dry_run=dry_run,
                     force=force,
                     project_lookup_cache=project_lookup_cache,
+                    pre_fetched_gh_data=gh_data_cache.get(repo_config.full_name),
                 )
             except Exception:
                 logger.exception(
@@ -106,6 +130,7 @@ class SyncEngine:
         dry_run: bool = False,
         force: bool = False,
         project_lookup_cache: Optional[dict[str, dict[str, Any]]] = None,
+        pre_fetched_gh_data: Optional[tuple[list[Any], Optional[dict[int, dict[str, str]]]]] = None,
     ):
         logger.info(
             f"[bold blue]Syncing {rc.full_name} → Jira {rc.jira_project}[/bold blue]"
@@ -150,20 +175,22 @@ class SyncEngine:
                     if iss.key in cached_hashes:
                         setattr(iss, "_quill_cached_hash", cached_hashes[iss.key])
 
-        # Step 1.8 — optimization #1: batch pre-fetch GitHub Projects V2 custom fields
-        repo_project_fields: Optional[dict[int, dict[str, str]]] = None
-        if rc.sync_project_fields:
-            logger.info("Batch fetching GitHub Projects V2 custom fields via GraphQL…")
-            repo_project_fields = self.gh_client.get_repo_project_fields(rc.owner, rc.repo)
+        # Step 1.8 & Step 2 — fetch or use pre-fetched GitHub issues and custom fields
+        if pre_fetched_gh_data is not None:
+            gh_issues, repo_project_fields = pre_fetched_gh_data
+        else:
+            repo_project_fields = None
+            if rc.sync_project_fields:
+                logger.info("Batch fetching GitHub Projects V2 custom fields via GraphQL…")
+                repo_project_fields = self.gh_client.get_repo_project_fields(rc.owner, rc.repo)
 
-        # Step 2 — fetch GitHub issues
-        gh_issues = self.gh_client.get_issues(
-            owner=rc.owner,
-            repo_name=rc.repo,
-            since=rc.issue_filter.since,
-            state=rc.issue_filter.state,
-            labels=rc.issue_filter.labels or None,
-        )
+            gh_issues = self.gh_client.get_issues(
+                owner=rc.owner,
+                repo_name=rc.repo,
+                since=rc.issue_filter.since,
+                state=rc.issue_filter.state,
+                labels=rc.issue_filter.labels or None,
+            )
 
         stats = {
             "created": 0,
