@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=61.0.0", "wheel"]
+requires = ["setuptools>=61.0.0", "wheel", "setuptools-scm>=8.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "quill-sync"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Query-based Unified Issue Lightweight Linker: Sync GitHub issues to an on-premise Jira instance (stateless)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -40,6 +40,9 @@ quill = "quill.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools_scm]
+version_file = "src/quill/_version.py"
+
 # ── Pixi ───────────────────────────────────────────────────────────────
 
 [tool.pixi.workspace]
@@ -48,6 +51,7 @@ platforms = ["linux-64", "osx-64", "osx-arm64", "win-64"]
 
 [tool.pixi.dependencies]
 python = ">=3.10"
+setuptools-scm = ">=8.0"
 pygithub = ">=2.3.0"
 jira = ">=3.8.0"
 pydantic-settings = ">=2.0.0"
