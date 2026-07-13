@@ -161,3 +161,28 @@ class TestProjectFieldsSync:
                 assert "*Project:* *Priority:* High \\| *Team:* Core Infra" in kwargs["description"]
 
 
+class TestMergeJiraLabels:
+    def test_merge_labels_with_entity_property(self, v2_config):
+        engine = SyncEngine(v2_config)
+        mock_jira_issue = MagicMock()
+        mock_jira_issue.fields.labels = ["github-synced", "proj-status-in-progress", "bug", "need-qa", "jira-custom"]
+        mock_jira_issue._quill_cached_synced_labels = ["github-synced", "proj-status-in-progress", "bug"]
+
+        all_labels = ["github-synced", "proj-status-done"]
+        merged = engine._merge_jira_labels(mock_jira_issue, "CAS-1", all_labels)
+        assert merged == ["github-synced", "jira-custom", "need-qa", "proj-status-done"]
+
+    def test_merge_labels_fallback_without_entity_property(self, v2_config):
+        engine = SyncEngine(v2_config)
+        mock_jira_issue = MagicMock()
+        mock_jira_issue.fields.labels = ["github-synced", "proj-status-in-progress", "bug", "need-qa"]
+        mock_jira_issue._quill_cached_synced_labels = None
+        engine.jira_client.get_issue_property_from_issue.return_value = None
+        engine.jira_client.get_issue_property.return_value = None
+
+        all_labels = ["github-synced", "proj-status-done", "bug"]
+        merged = engine._merge_jira_labels(mock_jira_issue, "CAS-1", all_labels)
+        assert merged == ["bug", "github-synced", "need-qa", "proj-status-done"]
+
+
+

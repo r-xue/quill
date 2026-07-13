@@ -67,7 +67,8 @@ class JiraClient:
                 issues = self.jira.search_issues(
                     jql,
                     maxResults=False,
-                    properties="quill-content-hash,quill-github-url",
+                    fields=f"summary,description,status,labels,{github_link_field}",
+                    properties="quill-content-hash,quill-github-url,quill-synced-labels",
                 )
                 lookup: dict[str, Any] = {}
                 for issue in issues:
@@ -79,6 +80,11 @@ class JiraClient:
                         )
                         if cached_hash:
                             setattr(issue, "_quill_cached_hash", cached_hash)
+                        cached_synced_labels = self.get_issue_property_from_issue(
+                            issue, "quill-synced-labels"
+                        )
+                        if cached_synced_labels is not None:
+                            setattr(issue, "_quill_cached_synced_labels", cached_synced_labels)
                 if lookup:
                     return lookup
                 # Custom field returned nothing — could be field not set yet.
@@ -106,8 +112,8 @@ class JiraClient:
             issues = self.jira.search_issues(
                 fallback_jql,
                 maxResults=False,
-                fields="summary,description,status",
-                properties="quill-content-hash,quill-github-url",
+                fields="summary,description,status,labels",
+                properties="quill-content-hash,quill-github-url,quill-synced-labels",
             )
         except Exception as exc:
             logger.warning(f"Fallback JQL also failed: {exc}")
@@ -122,6 +128,11 @@ class JiraClient:
             )
             if cached_hash:
                 setattr(issue, "_quill_cached_hash", cached_hash)
+            cached_synced_labels = self.get_issue_property_from_issue(
+                issue, "quill-synced-labels"
+            )
+            if cached_synced_labels is not None:
+                setattr(issue, "_quill_cached_synced_labels", cached_synced_labels)
 
             # Primary: check pre-fetched entity property (zero HTTP cost)
             gh_url = self.get_issue_property_from_issue(issue, "quill-github-url")
@@ -173,8 +184,8 @@ class JiraClient:
             issues = self.jira.search_issues(
                 jql,
                 maxResults=200,
-                fields="summary,description,status",
-                properties="quill-content-hash,quill-github-url",
+                fields="summary,description,status,labels",
+                properties="quill-content-hash,quill-github-url,quill-synced-labels",
             )
             for issue in issues:
                 s = getattr(issue.fields, "summary", "") or ""
@@ -184,6 +195,11 @@ class JiraClient:
                     )
                     if cached_hash:
                         setattr(issue, "_quill_cached_hash", cached_hash)
+                    cached_synced_labels = self.get_issue_property_from_issue(
+                        issue, "quill-synced-labels"
+                    )
+                    if cached_synced_labels is not None:
+                        setattr(issue, "_quill_cached_synced_labels", cached_synced_labels)
                     return issue
         except Exception as exc:
             logger.debug(f"Summary prefix lookup failed: {exc}")

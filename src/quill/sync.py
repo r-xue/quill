@@ -365,6 +365,9 @@ class SyncEngine:
                 self.jira_client.set_issue_property(
                     jira_key, "quill-github-url", gh_url
                 )
+                self.jira_client.set_issue_property(
+                    jira_key, "quill-synced-labels", all_labels
+                )
                 logger.info(f"Created {jira_key} for GH #{issue.number}")
             else:
                 jira_key = None
@@ -411,6 +414,7 @@ class SyncEngine:
                 existing_hash = None
 
             if existing_hash != current_hash:
+                merged_labels = self._merge_jira_labels(jira_issue, jira_key, all_labels)
                 logger.info(
                     f"Issue #{issue.number} changed (hash mismatch). "
                     f"Updating {jira_key}…"
@@ -420,7 +424,7 @@ class SyncEngine:
                         issue_key=jira_key,
                         summary=summary,
                         description=jira_description,
-                        labels=all_labels,
+                        labels=merged_labels,
                         due_date=due_date_str,
                     )
                     self.jira_client.set_issue_property(
@@ -429,13 +433,16 @@ class SyncEngine:
                     self.jira_client.set_issue_property(
                         jira_key, "quill-github-url", gh_url
                     )
+                    self.jira_client.set_issue_property(
+                        jira_key, "quill-synced-labels", all_labels
+                    )
                 else:
                     self._preview_issue(
                         action="UPDATE",
                         project=rc.jira_project,
                         summary=summary,
                         issue_type=self.config.jira_default_issue_type,
-                        labels=all_labels,
+                        labels=merged_labels,
                         gh_state=issue.state,
                         gh_url=gh_url,
                         description=jira_description,
@@ -526,6 +533,52 @@ class SyncEngine:
         _console.print(
             Panel(desc_preview, title="Description Preview", border_style="dim", width=100)
         )
+
+    def _merge_jira_labels(
+        self, jira_issue: Any, jira_key: str, all_labels: list[str]
+    ) -> list[str]:
+        """Preserve any custom labels added on the Jira side while updating Quill-managed labels.
+
+        Subtracts previously synced labels (stored in the 'quill-synced-labels' entity property)
+        and Quill label prefixes from the existing Jira labels to find Jira-originated labels.
+        """
+        existing_jira_labels = getattr(getattr(jira_issue, "fields", None), "labels", None) or []
+        if not isinstance(existing_jira_labels, list):
+            existing_jira_labels = []
+
+        last_synced_labels = getattr(jira_issue, "_quill_cached_synced_labels", None)
+        if last_synced_labels is None:
+            last_synced_labels = self.jira_client.get_issue_property_from_issue(
+                jira_issue, "quill-synced-labels"
+            )
+            if last_synced_labels is not None:
+                setattr(jira_issue, "_quill_cached_synced_labels", last_synced_labels)
+        if last_synced_labels is None:
+            last_synced_labels = self.jira_client.get_issue_property(
+                jira_key, "quill-synced-labels"
+            )
+            if last_synced_labels is not None:
+                setattr(jira_issue, "_quill_cached_synced_labels", last_synced_labels)
+
+        if isinstance(last_synced_labels, list):
+            last_synced_set = set(last_synced_labels)
+            jira_originated_labels = [
+                lb for lb in existing_jira_labels
+                if lb not in last_synced_set
+                and not lb.startswith(("proj-", "milestone-"))
+                and lb != "github-synced"
+            ]
+        else:
+            # Fallback for tickets that haven't been updated since the entity property was introduced
+            jira_originated_labels = [
+                lb for lb in existing_jira_labels
+                if not lb.startswith(("proj-", "milestone-"))
+                and lb != "github-synced"
+                and lb not in all_labels
+            ]
+
+        merged = sorted(set(all_labels + jira_originated_labels))
+        return merged
 
     # ── Comment sync ──────────────────────────────────────────────────────
 
