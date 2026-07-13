@@ -78,9 +78,9 @@ class TestHashFooter:
         assert extract_hash_footer("") is None
         assert extract_hash_footer(None) is None
 
-    def test_embed_replaces_old_footer(self):
+    def test_embed_strips_old_footer(self):
         desc = "text\n\n<!-- quill:sha256:1234567890abcdef -->"
         embedded = embed_hash_footer(desc, "newnew")
         assert "1234567890abcdef" not in embedded
-        assert "<!-- quill:sha256:newnew -->" in embedded
-        assert embedded == "text\n\n<!-- quill:sha256:newnew -->"
+        assert "<!-- quill:sha256:newnew -->" not in embedded
+        assert embedded == "text"

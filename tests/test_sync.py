@@ -82,6 +82,7 @@ class TestJiraClientEmptyField:
             called_jql = mock_jira_inst.search_issues.call_args[0][0]
             assert 'labels = "github-synced"' in called_jql
             assert mock_jira_inst.search_issues.call_args[1]["fields"] == "summary,description,status"
+            assert mock_jira_inst.search_issues.call_args[1]["properties"] == "quill-content-hash,quill-github-url"
             assert lookup == {"https://github.com/your-org/your-repo/issues/1": mock_issue}
 
 

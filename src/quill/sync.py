@@ -156,6 +156,12 @@ class SyncEngine:
             for iss in existing_lookup.values():
                 if getattr(iss, "_quill_cached_hash", None) is not None:
                     continue
+                loaded_hash = self.jira_client.get_issue_property_from_issue(
+                    iss, "quill-content-hash"
+                )
+                if loaded_hash:
+                    setattr(iss, "_quill_cached_hash", loaded_hash)
+                    continue
                 desc = getattr(getattr(iss, "fields", None), "description", "") or ""
                 footer_hash = extract_hash_footer(desc)
                 if footer_hash:
@@ -378,8 +384,14 @@ class SyncEngine:
             # ── EXISTS — check for changes ─────────────────────────────────
             jira_key = jira_issue.key
 
-            # Primary: read hash from pre-fetched cache or description comment (zero HTTP cost)
+            # Primary: read hash from pre-fetched cache or issue property (zero HTTP cost)
             existing_hash = getattr(jira_issue, "_quill_cached_hash", None)
+            if existing_hash is None:
+                existing_hash = self.jira_client.get_issue_property_from_issue(
+                    jira_issue, "quill-content-hash"
+                )
+                if existing_hash is not None:
+                    setattr(jira_issue, "_quill_cached_hash", existing_hash)
             if existing_hash is None:
                 existing_hash = extract_hash_footer(
                     getattr(jira_issue.fields, "description", "") or ""
