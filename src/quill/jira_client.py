@@ -29,6 +29,20 @@ class JiraClient:
 
     # ── Stateless lookup via JQL ──────────────────────────────────────────
 
+    @staticmethod
+    def get_issue_property_from_issue(issue: Any, property_key: str) -> Any | None:
+        """Extract a property value pre-fetched inside a search_issues response object."""
+        raw = getattr(issue, "raw", None)
+        if isinstance(raw, dict):
+            props = raw.get("properties")
+            if isinstance(props, dict):
+                prop = props.get(property_key)
+                if isinstance(prop, dict) and "value" in prop:
+                    return prop["value"]
+                elif prop is not None and not isinstance(prop, dict):
+                    return prop
+        return None
+
     def get_synced_issues(
         self, project: str, github_link_field: str
     ) -> dict[str, Any]:
@@ -50,12 +64,21 @@ class JiraClient:
             )
             logger.info(f"JQL lookup: {jql}")
             try:
-                issues = self.jira.search_issues(jql, maxResults=False)
+                issues = self.jira.search_issues(
+                    jql,
+                    maxResults=False,
+                    properties="quill-content-hash,quill-github-url",
+                )
                 lookup: dict[str, Any] = {}
                 for issue in issues:
                     gh_url = getattr(issue.fields, github_link_field, None)
                     if gh_url:
                         lookup[gh_url] = issue
+                        cached_hash = self.get_issue_property_from_issue(
+                            issue, "quill-content-hash"
+                        )
+                        if cached_hash:
+                            setattr(issue, "_quill_cached_hash", cached_hash)
                 if lookup:
                     return lookup
                 # Custom field returned nothing — could be field not set yet.
@@ -81,7 +104,10 @@ class JiraClient:
         logger.info(f"JQL fallback (label-based): {fallback_jql}")
         try:
             issues = self.jira.search_issues(
-                fallback_jql, maxResults=False, fields="summary,description,status"
+                fallback_jql,
+                maxResults=False,
+                fields="summary,description,status",
+                properties="quill-content-hash,quill-github-url",
             )
         except Exception as exc:
             logger.warning(f"Fallback JQL also failed: {exc}")
@@ -91,9 +117,18 @@ class JiraClient:
         unresolved_issues = []  # issues where description parsing didn't find a URL
         for issue in issues:
             summary = getattr(issue.fields, "summary", "") or ""
-            # Primary: extract GitHub URL from description text (zero HTTP cost)
-            description = getattr(issue.fields, "description", "") or ""
-            gh_url = _extract_github_url(description)
+            cached_hash = self.get_issue_property_from_issue(
+                issue, "quill-content-hash"
+            )
+            if cached_hash:
+                setattr(issue, "_quill_cached_hash", cached_hash)
+
+            # Primary: check pre-fetched entity property (zero HTTP cost)
+            gh_url = self.get_issue_property_from_issue(issue, "quill-github-url")
+            if not gh_url:
+                # Secondary: extract GitHub URL from description text
+                description = getattr(issue.fields, "description", "") or ""
+                gh_url = _extract_github_url(description)
             if gh_url:
                 lookup[gh_url] = issue
             else:
@@ -136,11 +171,19 @@ class JiraClient:
         )
         try:
             issues = self.jira.search_issues(
-                jql, maxResults=200, fields="summary,description,status"
+                jql,
+                maxResults=200,
+                fields="summary,description,status",
+                properties="quill-content-hash,quill-github-url",
             )
             for issue in issues:
                 s = getattr(issue.fields, "summary", "") or ""
                 if s.startswith(prefix):
+                    cached_hash = self.get_issue_property_from_issue(
+                        issue, "quill-content-hash"
+                    )
+                    if cached_hash:
+                        setattr(issue, "_quill_cached_hash", cached_hash)
                     return issue
         except Exception as exc:
             logger.debug(f"Summary prefix lookup failed: {exc}")
