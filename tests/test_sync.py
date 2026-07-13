@@ -185,4 +185,32 @@ class TestMergeJiraLabels:
         assert merged == ["bug", "github-synced", "need-qa", "proj-status-done"]
 
 
+class TestSyncParentRelationships:
+    def test_resolve_parent_jira_key_direct_key(self, v2_config):
+        engine = SyncEngine(v2_config)
+        resolved = engine._resolve_parent_jira_key("CAS-100", {}, "CAS")
+        assert resolved == "CAS-100"
 
+    def test_resolve_parent_jira_key_via_lookup(self, v2_config):
+        engine = SyncEngine(v2_config)
+        mock_parent_issue = MagicMock()
+        mock_parent_issue.key = "CAS-12"
+        lookup = {"https://github.com/test-owner/test-repo/issues/12": mock_parent_issue}
+
+        resolved = engine._resolve_parent_jira_key("#12", lookup, "CAS")
+        assert resolved == "CAS-12"
+
+    def test_sync_parent_relationships(self, v2_config):
+        engine = SyncEngine(v2_config)
+        mock_parent_issue = MagicMock()
+        mock_parent_issue.key = "CAS-12"
+        lookup = {"https://github.com/test-owner/test-repo/issues/12": mock_parent_issue}
+        pending = {"https://github.com/test-owner/test-repo/issues/42": ("CAS-42", "#12")}
+
+        with patch.object(engine.jira_client, "set_parent_issue") as mock_set_parent:
+            engine._sync_parent_relationships(v2_config.repos[0], pending, lookup, dry_run=False)
+            mock_set_parent.assert_called_once_with(
+                issue_key="CAS-42",
+                parent_key="CAS-12",
+                epic_link_field="customfield_10014",
+            )

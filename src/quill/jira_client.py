@@ -317,6 +317,68 @@ class JiraClient:
         if due_date:
             self.set_due_date(issue_key, due_date)
 
+    def set_parent_issue(
+        self,
+        issue_key: str,
+        parent_key: str,
+        epic_link_field: Optional[str] = "customfield_10014",
+    ) -> bool:
+        """Link an issue to its parent or epic in Jira.
+
+        Attempts native 'parent' field first (modern Jira Cloud & subtasks), then
+        falls back to 'Epic Link' custom field (Jira Server/Data Center epics),
+        and finally creates a 'Parent / Child' or 'Epic-Story Link' issue link.
+        """
+        if issue_key == parent_key:
+            return False
+
+        logger.info(f"Linking {issue_key} -> parent/epic {parent_key}…")
+        try:
+            issue = self.jira.issue(issue_key)
+        except Exception as exc:
+            logger.error(f"Failed to fetch issue {issue_key} for parent linking: {exc}")
+            return False
+
+        # Check if already linked via parent field
+        curr_parent = getattr(issue.fields, "parent", None)
+        if getattr(curr_parent, "key", None) == parent_key or str(curr_parent) == parent_key:
+            return False
+
+        # Check if already linked via epic link field
+        if epic_link_field:
+            curr_epic = getattr(issue.fields, epic_link_field, None)
+            if getattr(curr_epic, "key", None) == parent_key or str(curr_epic) == parent_key:
+                return False
+
+        # Attempt 1: native 'parent' field
+        try:
+            issue.update(fields={"parent": {"key": parent_key}})
+            logger.info(f"Linked {issue_key} to parent {parent_key} via 'parent' field")
+            return True
+        except Exception as exc1:
+            logger.debug(f"Could not link {issue_key} -> {parent_key} via 'parent' field ({exc1}); trying Epic Link field…")
+
+        # Attempt 2: Epic Link field
+        if epic_link_field:
+            try:
+                issue.update(fields={epic_link_field: parent_key})
+                logger.info(f"Linked {issue_key} to epic {parent_key} via '{epic_link_field}'")
+                return True
+            except Exception as exc2:
+                logger.debug(f"Could not link {issue_key} -> {parent_key} via '{epic_link_field}' ({exc2}); trying Issue Links…")
+
+        # Attempt 3: Issue Link (Parent / Child or Epic-Story Link or relates to)
+        for link_type in ("Parent / Child", "Epic-Story Link", "Relates", "relates to"):
+            try:
+                self.jira.create_issue_link(type=link_type, inboundIssue=issue_key, outboundIssue=parent_key)
+                logger.info(f"Linked {issue_key} to {parent_key} via '{link_type}' issue link")
+                return True
+            except Exception:
+                continue
+
+        logger.warning(f"Failed to link {issue_key} -> {parent_key} using parent, {epic_link_field}, or issue links.")
+        return False
+
     # ── Comments ──────────────────────────────────────────────────────────
 
     def get_existing_comments(self, issue_key: str) -> list[str]:
