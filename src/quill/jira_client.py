@@ -350,22 +350,27 @@ class JiraClient:
             if getattr(curr_epic, "key", None) == parent_key or str(curr_epic) == parent_key:
                 return False
 
-        # Attempt 1: native 'parent' field
-        try:
-            issue.update(fields={"parent": {"key": parent_key}})
-            logger.info(f"Linked {issue_key} to parent {parent_key} via 'parent' field")
-            return True
-        except Exception as exc1:
-            logger.debug(f"Could not link {issue_key} -> {parent_key} via 'parent' field ({exc1}); trying Epic Link field…")
-
-        # Attempt 2: Epic Link field
+        # Attempt 1: Epic Link custom field (required for Epics on Jira Data Center, Server, & Cloud Classic)
         if epic_link_field:
             try:
                 issue.update(fields={epic_link_field: parent_key})
                 logger.info(f"Linked {issue_key} to epic {parent_key} via '{epic_link_field}'")
+                # Also attempt setting native 'parent' field for universal compatibility across Jira Cloud views
+                try:
+                    issue.update(fields={"parent": {"key": parent_key}})
+                except Exception:
+                    pass
                 return True
-            except Exception as exc2:
-                logger.debug(f"Could not link {issue_key} -> {parent_key} via '{epic_link_field}' ({exc2}); trying Issue Links…")
+            except Exception as exc1:
+                logger.debug(f"Could not link {issue_key} -> {parent_key} via '{epic_link_field}' ({exc1}); trying 'parent' field…")
+
+        # Attempt 2: native 'parent' field (for subtasks, Team-Managed Cloud projects, or Parent Link)
+        try:
+            issue.update(fields={"parent": {"key": parent_key}})
+            logger.info(f"Linked {issue_key} to parent {parent_key} via 'parent' field")
+            return True
+        except Exception as exc2:
+            logger.debug(f"Could not link {issue_key} -> {parent_key} via 'parent' field ({exc2}); trying Issue Links…")
 
         # Attempt 3: Issue Link (Parent / Child or Epic-Story Link or relates to)
         for link_type in ("Parent / Child", "Epic-Story Link", "Relates", "relates to"):
