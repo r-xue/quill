@@ -67,7 +67,8 @@ class JiraClient:
                 issues = self.jira.search_issues(
                     jql,
                     maxResults=False,
-                    properties="quill-content-hash,quill-github-url",
+                    fields=f"summary,description,status,labels,{github_link_field}",
+                    properties="quill-content-hash,quill-github-url,quill-synced-labels",
                 )
                 lookup: dict[str, Any] = {}
                 for issue in issues:
@@ -79,6 +80,11 @@ class JiraClient:
                         )
                         if cached_hash:
                             setattr(issue, "_quill_cached_hash", cached_hash)
+                        cached_synced_labels = self.get_issue_property_from_issue(
+                            issue, "quill-synced-labels"
+                        )
+                        if cached_synced_labels is not None:
+                            setattr(issue, "_quill_cached_synced_labels", cached_synced_labels)
                 if lookup:
                     return lookup
                 # Custom field returned nothing — could be field not set yet.
@@ -106,8 +112,8 @@ class JiraClient:
             issues = self.jira.search_issues(
                 fallback_jql,
                 maxResults=False,
-                fields="summary,description,status",
-                properties="quill-content-hash,quill-github-url",
+                fields="summary,description,status,labels",
+                properties="quill-content-hash,quill-github-url,quill-synced-labels",
             )
         except Exception as exc:
             logger.warning(f"Fallback JQL also failed: {exc}")
@@ -122,6 +128,11 @@ class JiraClient:
             )
             if cached_hash:
                 setattr(issue, "_quill_cached_hash", cached_hash)
+            cached_synced_labels = self.get_issue_property_from_issue(
+                issue, "quill-synced-labels"
+            )
+            if cached_synced_labels is not None:
+                setattr(issue, "_quill_cached_synced_labels", cached_synced_labels)
 
             # Primary: check pre-fetched entity property (zero HTTP cost)
             gh_url = self.get_issue_property_from_issue(issue, "quill-github-url")
@@ -173,8 +184,8 @@ class JiraClient:
             issues = self.jira.search_issues(
                 jql,
                 maxResults=200,
-                fields="summary,description,status",
-                properties="quill-content-hash,quill-github-url",
+                fields="summary,description,status,labels",
+                properties="quill-content-hash,quill-github-url,quill-synced-labels",
             )
             for issue in issues:
                 s = getattr(issue.fields, "summary", "") or ""
@@ -184,6 +195,11 @@ class JiraClient:
                     )
                     if cached_hash:
                         setattr(issue, "_quill_cached_hash", cached_hash)
+                    cached_synced_labels = self.get_issue_property_from_issue(
+                        issue, "quill-synced-labels"
+                    )
+                    if cached_synced_labels is not None:
+                        setattr(issue, "_quill_cached_synced_labels", cached_synced_labels)
                     return issue
         except Exception as exc:
             logger.debug(f"Summary prefix lookup failed: {exc}")
@@ -300,6 +316,68 @@ class JiraClient:
 
         if due_date:
             self.set_due_date(issue_key, due_date)
+
+    def set_parent_issue(
+        self,
+        issue_key: str,
+        parent_key: str,
+        epic_link_field: Optional[str] = "customfield_10014",
+    ) -> bool:
+        """Link an issue to its parent or epic in Jira.
+
+        Attempts native 'parent' field first (modern Jira Cloud & subtasks), then
+        falls back to 'Epic Link' custom field (Jira Server/Data Center epics),
+        and finally creates a 'Parent / Child' or 'Epic-Story Link' issue link.
+        """
+        if issue_key == parent_key:
+            return False
+
+        logger.info(f"Linking {issue_key} -> parent/epic {parent_key}…")
+        try:
+            issue = self.jira.issue(issue_key)
+        except Exception as exc:
+            logger.error(f"Failed to fetch issue {issue_key} for parent linking: {exc}")
+            return False
+
+        # Check if already linked via parent field
+        curr_parent = getattr(issue.fields, "parent", None)
+        if getattr(curr_parent, "key", None) == parent_key or str(curr_parent) == parent_key:
+            return False
+
+        # Check if already linked via epic link field
+        if epic_link_field:
+            curr_epic = getattr(issue.fields, epic_link_field, None)
+            if getattr(curr_epic, "key", None) == parent_key or str(curr_epic) == parent_key:
+                return False
+
+        # Attempt 1: native 'parent' field
+        try:
+            issue.update(fields={"parent": {"key": parent_key}})
+            logger.info(f"Linked {issue_key} to parent {parent_key} via 'parent' field")
+            return True
+        except Exception as exc1:
+            logger.debug(f"Could not link {issue_key} -> {parent_key} via 'parent' field ({exc1}); trying Epic Link field…")
+
+        # Attempt 2: Epic Link field
+        if epic_link_field:
+            try:
+                issue.update(fields={epic_link_field: parent_key})
+                logger.info(f"Linked {issue_key} to epic {parent_key} via '{epic_link_field}'")
+                return True
+            except Exception as exc2:
+                logger.debug(f"Could not link {issue_key} -> {parent_key} via '{epic_link_field}' ({exc2}); trying Issue Links…")
+
+        # Attempt 3: Issue Link (Parent / Child or Epic-Story Link or relates to)
+        for link_type in ("Parent / Child", "Epic-Story Link", "Relates", "relates to"):
+            try:
+                self.jira.create_issue_link(type=link_type, inboundIssue=issue_key, outboundIssue=parent_key)
+                logger.info(f"Linked {issue_key} to {parent_key} via '{link_type}' issue link")
+                return True
+            except Exception:
+                continue
+
+        logger.warning(f"Failed to link {issue_key} -> {parent_key} using parent, {epic_link_field}, or issue links.")
+        return False
 
     # ── Comments ──────────────────────────────────────────────────────────
 

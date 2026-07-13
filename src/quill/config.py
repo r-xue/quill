@@ -60,6 +60,7 @@ class GitHubRepoConfig(BaseModel):
     sync_comments: bool = True
     sync_project_fields: bool = False
     sync_milestones: bool = True
+    sync_parent_links: bool = True
     issue_filter: GitHubIssueFilter = Field(default_factory=GitHubIssueFilter)
 
     @property
@@ -132,6 +133,7 @@ class Settings(BaseSettings):
     jira_verify_ssl: bool = True
     jira_default_issue_type: str = "Task"
     jira_github_link_field: str = ""
+    jira_epic_link_field: str = "customfield_10014"
 
     # ── Sync ───────────────────────────────────────────────────────────
     dry_run: bool = False

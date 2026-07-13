@@ -95,6 +95,9 @@ class SyncEngine:
                 p_fields = None
                 if rc.sync_project_fields:
                     p_fields = self.gh_client.get_repo_project_fields(rc.owner, rc.repo)
+                p_parents = None
+                if getattr(rc, "sync_parent_links", True):
+                    p_parents = self.gh_client.get_repo_issue_parents(rc.owner, rc.repo)
                 iss = self.gh_client.get_issues(
                     owner=rc.owner,
                     repo_name=rc.repo,
@@ -102,7 +105,7 @@ class SyncEngine:
                     state=rc.issue_filter.state,
                     labels=rc.issue_filter.labels or None,
                 )
-                return rc.full_name, (iss, p_fields)
+                return rc.full_name, (iss, p_fields, p_parents)
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(repos))) as executor:
                 for full_name, data in executor.map(_fetch_gh, repos):
@@ -183,12 +186,20 @@ class SyncEngine:
 
         # Step 1.8 & Step 2 — fetch or use pre-fetched GitHub issues and custom fields
         if pre_fetched_gh_data is not None:
-            gh_issues, repo_project_fields = pre_fetched_gh_data
+            if len(pre_fetched_gh_data) == 3:
+                gh_issues, repo_project_fields, repo_parents = pre_fetched_gh_data
+            else:
+                gh_issues, repo_project_fields = pre_fetched_gh_data
+                repo_parents = None
         else:
             repo_project_fields = None
             if rc.sync_project_fields:
                 logger.info("Batch fetching GitHub Projects V2 custom fields via GraphQL…")
                 repo_project_fields = self.gh_client.get_repo_project_fields(rc.owner, rc.repo)
+            repo_parents = None
+            if getattr(rc, "sync_parent_links", True):
+                logger.info("Batch fetching GitHub issue parents via GraphQL…")
+                repo_parents = self.gh_client.get_repo_issue_parents(rc.owner, rc.repo)
 
             gh_issues = self.gh_client.get_issues(
                 owner=rc.owner,
@@ -205,6 +216,7 @@ class SyncEngine:
             "comments": 0,
             "errors": 0,
         }
+        pending_parent_links: dict[str, tuple[str, str]] = {}
 
         for issue in gh_issues:
             try:
@@ -216,12 +228,17 @@ class SyncEngine:
                     force,
                     stats,
                     repo_project_fields=repo_project_fields,
+                    repo_parents=repo_parents,
+                    pending_parent_links=pending_parent_links,
                 )
             except Exception as exc:
                 stats["errors"] += 1
                 logger.error(
                     f"Error syncing issue #{issue.number} ({issue.title}): {exc}"
                 )
+
+        # Step 3 — sync parent/epic relationships after all issues in repo are processed
+        self._sync_parent_relationships(rc, pending_parent_links, existing_lookup, dry_run)
 
         logger.info(
             f"[bold green]Done {rc.full_name}:[/bold green] "
@@ -241,6 +258,8 @@ class SyncEngine:
         force: bool,
         stats: dict[str, int],
         repo_project_fields: Optional[dict[int, dict[str, str]]] = None,
+        repo_parents: Optional[dict[int, str]] = None,
+        pending_parent_links: Optional[dict[str, tuple[str, str]]] = None,
     ):
         gh_url: str = issue.html_url
         issue_labels = [label.name for label in issue.labels]
@@ -365,6 +384,9 @@ class SyncEngine:
                 self.jira_client.set_issue_property(
                     jira_key, "quill-github-url", gh_url
                 )
+                self.jira_client.set_issue_property(
+                    jira_key, "quill-synced-labels", all_labels
+                )
                 logger.info(f"Created {jira_key} for GH #{issue.number}")
             else:
                 jira_key = None
@@ -411,6 +433,7 @@ class SyncEngine:
                 existing_hash = None
 
             if existing_hash != current_hash:
+                merged_labels = self._merge_jira_labels(jira_issue, jira_key, all_labels)
                 logger.info(
                     f"Issue #{issue.number} changed (hash mismatch). "
                     f"Updating {jira_key}…"
@@ -420,7 +443,7 @@ class SyncEngine:
                         issue_key=jira_key,
                         summary=summary,
                         description=jira_description,
-                        labels=all_labels,
+                        labels=merged_labels,
                         due_date=due_date_str,
                     )
                     self.jira_client.set_issue_property(
@@ -429,13 +452,16 @@ class SyncEngine:
                     self.jira_client.set_issue_property(
                         jira_key, "quill-github-url", gh_url
                     )
+                    self.jira_client.set_issue_property(
+                        jira_key, "quill-synced-labels", all_labels
+                    )
                 else:
                     self._preview_issue(
                         action="UPDATE",
                         project=rc.jira_project,
                         summary=summary,
                         issue_type=self.config.jira_default_issue_type,
-                        labels=all_labels,
+                        labels=merged_labels,
                         gh_state=issue.state,
                         gh_url=gh_url,
                         description=jira_description,
@@ -465,6 +491,25 @@ class SyncEngine:
                     logger.info(
                         f"[Dry Run] Would transition {display_key} to Done/Closed"
                     )
+
+        # ── Parent / Epic relationship check ─────────────────────────
+        if getattr(rc, "sync_parent_links", True):
+            parent_ref = None
+            if repo_parents and issue.number in repo_parents:
+                parent_ref = repo_parents[issue.number]
+            elif repo_project_fields and issue.number in repo_project_fields:
+                for k, v in repo_project_fields[issue.number].items():
+                    if k.lower() in ("parent", "parent issue", "epic", "epic link") and v:
+                        parent_ref = v
+                        break
+            elif rc.sync_project_fields:
+                pfields = self.gh_client.get_issue_project_fields(issue)
+                for k, v in pfields.items():
+                    if k.lower() in ("parent", "parent issue", "epic", "epic link") and v:
+                        parent_ref = v
+                        break
+            if parent_ref and (jira_key or dry_run) and pending_parent_links is not None:
+                pending_parent_links[gh_url] = (jira_key or f"GH #{issue.number}", parent_ref)
 
         # ── Comment sync ─────────────────────────────────────────────
         if rc.sync_comments and getattr(issue, "comments", 0) > 0:
@@ -526,6 +571,118 @@ class SyncEngine:
         _console.print(
             Panel(desc_preview, title="Description Preview", border_style="dim", width=100)
         )
+
+    def _merge_jira_labels(
+        self, jira_issue: Any, jira_key: str, all_labels: list[str]
+    ) -> list[str]:
+        """Preserve any custom labels added on the Jira side while updating Quill-managed labels.
+
+        Subtracts previously synced labels (stored in the 'quill-synced-labels' entity property)
+        and Quill label prefixes from the existing Jira labels to find Jira-originated labels.
+        """
+        existing_jira_labels = getattr(getattr(jira_issue, "fields", None), "labels", None) or []
+        if not isinstance(existing_jira_labels, list):
+            existing_jira_labels = []
+
+        last_synced_labels = getattr(jira_issue, "_quill_cached_synced_labels", None)
+        if last_synced_labels is None:
+            last_synced_labels = self.jira_client.get_issue_property_from_issue(
+                jira_issue, "quill-synced-labels"
+            )
+            if last_synced_labels is not None:
+                setattr(jira_issue, "_quill_cached_synced_labels", last_synced_labels)
+        if last_synced_labels is None:
+            last_synced_labels = self.jira_client.get_issue_property(
+                jira_key, "quill-synced-labels"
+            )
+            if last_synced_labels is not None:
+                setattr(jira_issue, "_quill_cached_synced_labels", last_synced_labels)
+
+        if isinstance(last_synced_labels, list):
+            last_synced_set = set(last_synced_labels)
+            jira_originated_labels = [
+                lb for lb in existing_jira_labels
+                if lb not in last_synced_set
+                and not lb.startswith(("proj-", "milestone-"))
+                and lb != "github-synced"
+            ]
+        else:
+            # Fallback for tickets that haven't been updated since the entity property was introduced
+            jira_originated_labels = [
+                lb for lb in existing_jira_labels
+                if not lb.startswith(("proj-", "milestone-"))
+                and lb != "github-synced"
+                and lb not in all_labels
+            ]
+
+        merged = sorted(set(all_labels + jira_originated_labels))
+        return merged
+
+    def _resolve_parent_jira_key(
+        self, parent_ref: str, lookup: dict[str, Any], project: str
+    ) -> Optional[str]:
+        if not parent_ref:
+            return None
+        parent_ref = parent_ref.strip()
+        if re.match(r"^[A-Z][A-Z0-9]+-\d+$", parent_ref):
+            return parent_ref
+
+        if parent_ref in lookup:
+            p_issue = lookup[parent_ref]
+            if getattr(p_issue, "key", None):
+                return p_issue.key
+
+        clean_num = re.sub(r"[^0-9]", "", parent_ref)
+        if clean_num:
+            for rc in self.config.repos:
+                if rc.jira_project == project:
+                    url = f"https://github.com/{rc.owner}/{rc.repo}/issues/{clean_num}"
+                    if url in lookup:
+                        p_issue = lookup[url]
+                        if getattr(p_issue, "key", None):
+                            return p_issue.key
+
+        if clean_num:
+            for rc in self.config.repos:
+                if rc.jira_project == project:
+                    prefix = f"[{rc.repo}#{clean_num}]"
+                    p_issue = self.jira_client.find_by_summary_prefix(project, prefix)
+                    if p_issue and getattr(p_issue, "key", None):
+                        url = f"https://github.com/{rc.owner}/{rc.repo}/issues/{clean_num}"
+                        lookup[url] = p_issue
+                        return p_issue.key
+        return None
+
+    def _sync_parent_relationships(
+        self,
+        rc: GitHubRepoConfig,
+        pending_parent_links: dict[str, tuple[str, str]],
+        lookup: dict[str, Any],
+        dry_run: bool,
+    ):
+        if not getattr(rc, "sync_parent_links", True) or not pending_parent_links:
+            return
+
+        logger.info(f"Syncing parent/epic relationships for {len(pending_parent_links)} issues in {rc.full_name}…")
+        for child_gh_url, (child_jira_key, parent_ref) in pending_parent_links.items():
+            parent_jira_key = self._resolve_parent_jira_key(
+                parent_ref, lookup, rc.jira_project
+            )
+            if not parent_jira_key:
+                if not dry_run:
+                    logger.debug(f"Could not resolve Jira key for parent reference '{parent_ref}' of {child_jira_key}")
+                continue
+
+            if not dry_run:
+                self.jira_client.set_parent_issue(
+                    issue_key=child_jira_key,
+                    parent_key=parent_jira_key,
+                    epic_link_field=self.config.jira_epic_link_field,
+                )
+            else:
+                logger.info(
+                    f"[Dry Run] Would link {child_jira_key} to parent/epic {parent_jira_key}"
+                )
 
     # ── Comment sync ──────────────────────────────────────────────────────
 

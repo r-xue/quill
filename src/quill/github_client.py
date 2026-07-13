@@ -220,6 +220,78 @@ class GitHubClient:
             logger.warning(f"Failed to batch fetch repo project fields via GraphQL: {exc}")
             return {}
 
+    def get_repo_issue_parents(self, owner: str, repo_name: str) -> dict[int, str]:
+        """Fetch native GitHub sub-issue parent URLs via batch GraphQL.
+
+        Returns:
+            A dictionary mapping issue number to the parent issue's GitHub HTML URL.
+        """
+        if not self.token:
+            return {}
+
+        query = """
+        query($owner: String!, $name: String!, $cursor: String) {
+          repository(owner: $owner, name: $name) {
+            issues(first: 100, after: $cursor) {
+              pageInfo {
+                hasNextPage
+                endCursor
+              }
+              nodes {
+                number
+                parent {
+                  ... on Issue {
+                    number
+                    repository {
+                      name
+                      owner { login }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        """
+        results: dict[int, str] = {}
+        cursor = None
+        has_next_page = True
+
+        try:
+            while has_next_page:
+                variables = {"owner": owner, "name": repo_name, "cursor": cursor}
+                req = urllib.request.Request(
+                    "https://api.github.com/graphql",
+                    data=json.dumps({"query": query, "variables": variables}).encode("utf-8"),
+                    headers={
+                        "Authorization": f"Bearer {self.token}",
+                        "Content-Type": "application/json",
+                        "User-Agent": "quill",
+                    },
+                )
+                with urllib.request.urlopen(req) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+
+                issues_data = data.get("data", {}).get("repository", {}).get("issues", {})
+                for node in issues_data.get("nodes", []) or []:
+                    if not node:
+                        continue
+                    num = node.get("number")
+                    parent_node = node.get("parent")
+                    if num and isinstance(parent_node, dict):
+                        p_num = parent_node.get("number")
+                        p_repo = parent_node.get("repository", {}).get("name")
+                        p_owner = parent_node.get("repository", {}).get("owner", {}).get("login")
+                        if p_num and p_repo and p_owner:
+                            results[num] = f"https://github.com/{p_owner}/{p_repo}/issues/{p_num}"
+
+                page_info = issues_data.get("pageInfo", {})
+                has_next_page = page_info.get("hasNextPage", False)
+                cursor = page_info.get("endCursor")
+        except Exception as exc:
+            logger.warning(f"Batch GraphQL parent lookup failed for {owner}/{repo_name}: {exc}")
+        return results
+
     def get_issue_project_fields(self, issue: Any) -> dict[str, str]:
         """Fetch custom fields from GitHub Projects V2 for the given issue via GraphQL.
 
@@ -316,3 +388,18 @@ class GitHubClient:
         except Exception as exc:
             logger.debug(f"Failed to fetch GraphQL project fields for #{getattr(issue, 'number', '?')}: {exc}")
             return {}
+
+    def get_issue_parent_url(self, issue: Any) -> Optional[str]:
+        """Fetch the parent issue URL for a single issue via GraphQL."""
+        if not self.token or not getattr(issue, "html_url", None):
+            return None
+        parts = issue.html_url.split("/")
+        if len(parts) >= 7 and parts[-2] == "issues":
+            owner, repo_name, num_str = parts[-4], parts[-3], parts[-1]
+            try:
+                num = int(num_str)
+                parents = self.get_repo_issue_parents(owner, repo_name)
+                return parents.get(num)
+            except Exception:
+                pass
+        return None
