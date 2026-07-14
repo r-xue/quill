@@ -1,7 +1,7 @@
 import warnings
 import requests
 import concurrent.futures
-from typing import Optional, Any
+from typing import Optional, Any, Union
 from jira import JIRA
 from quill.log import logger
 
@@ -41,6 +41,68 @@ class JiraClient:
             logger.debug(f"Could not query Jira field metadata ({exc}); using default {default}")
         self._discovered_epic_link_field = default
         return self._discovered_epic_link_field
+
+    def discover_epic_name_field_id(self, default: Optional[str] = "customfield_10001") -> Optional[str]:
+        """Dynamically discover the real custom field ID for 'Epic Name' on this Jira server."""
+        if hasattr(self, "_discovered_epic_name_field") and self._discovered_epic_name_field is not None:
+            return self._discovered_epic_name_field
+        try:
+            for f in self.jira.fields():
+                if f.get("name") == "Epic Name" and f.get("id", "").startswith("customfield_"):
+                    self._discovered_epic_name_field = f["id"]
+                    logger.debug(f"Discovered Epic Name custom field ID: {self._discovered_epic_name_field}")
+                    return self._discovered_epic_name_field
+        except Exception as exc:
+            logger.debug(f"Could not query Jira field metadata ({exc}); using default {default}")
+        self._discovered_epic_name_field = default
+        return self._discovered_epic_name_field
+
+    def set_epic_name(self, issue_key: str, epic_name: str) -> bool:
+        """Set the Epic Name custom field on a Jira Epic issue safely."""
+        epic_name_field = self.discover_epic_name_field_id()
+        if not epic_name_field or not epic_name:
+            return False
+        truncated_name = epic_name[:250]
+        try:
+            issue = self.jira.issue(issue_key)
+            curr_val = getattr(issue.fields, epic_name_field, None)
+            if curr_val == truncated_name:
+                return True
+            issue.update(fields={epic_name_field: truncated_name})
+            logger.debug(f"Set Epic Name on {issue_key} to '{truncated_name}'")
+            return True
+        except Exception as exc:
+            logger.debug(f"Could not set Epic Name ({epic_name_field}) on {issue_key}: {exc}")
+            return False
+
+    def discover_subtask_issue_type(self, default: str = "Sub-task") -> str:
+        """Dynamically discover the real issue type name for sub-tasks on this Jira server."""
+        if hasattr(self, "_discovered_subtask_type") and self._discovered_subtask_type is not None:
+            return self._discovered_subtask_type
+        try:
+            issue_types = self.jira.issue_types()
+            # 1. First priority: exact standard names ('Sub-task' or 'Subtask') that are marked as subtask
+            for t in issue_types:
+                if getattr(t, "subtask", False) and t.name.lower() in ("sub-task", "subtask"):
+                    self._discovered_subtask_type = t.name
+                    logger.debug(f"Discovered exact Sub-task issue type name: {self._discovered_subtask_type}")
+                    return self._discovered_subtask_type
+            # 2. Second priority: any issue type literally named 'Sub-task' or 'Subtask'
+            for t in issue_types:
+                if t.name.lower() in ("sub-task", "subtask"):
+                    self._discovered_subtask_type = t.name
+                    logger.debug(f"Discovered Sub-task issue type name by string match: {self._discovered_subtask_type}")
+                    return self._discovered_subtask_type
+            # 3. Fallback: any issue type marked subtask=True (e.g. 'Engineering Sub-Task')
+            for t in issue_types:
+                if getattr(t, "subtask", False):
+                    self._discovered_subtask_type = t.name
+                    logger.debug(f"Discovered fallback subtask issue type name: {self._discovered_subtask_type}")
+                    return self._discovered_subtask_type
+        except Exception as exc:
+            logger.debug(f"Could not query Jira issue types ({exc}); using default {default}")
+        self._discovered_subtask_type = default
+        return self._discovered_subtask_type
 
     # ── Stateless lookup via JQL ──────────────────────────────────────────
 
@@ -82,11 +144,12 @@ class JiraClient:
                 issues = self.jira.search_issues(
                     jql,
                     maxResults=False,
-                    fields=f"summary,description,status,labels,{github_link_field}",
-                    properties="quill-content-hash,quill-github-url,quill-synced-labels",
+                    fields=f"summary,description,status,labels,issuetype,parent,{github_link_field}",
+                    properties="quill-content-hash,quill-github-url,quill-synced-labels,quill-synced-comments-count",
                 )
                 lookup: dict[str, Any] = {}
                 for issue in issues:
+                    setattr(issue, "_quill_cached_hash_checked", True)
                     gh_url = getattr(issue.fields, github_link_field, None)
                     if gh_url:
                         lookup[gh_url] = issue
@@ -100,6 +163,14 @@ class JiraClient:
                         )
                         if cached_synced_labels is not None:
                             setattr(issue, "_quill_cached_synced_labels", cached_synced_labels)
+                        cached_comments_count = self.get_issue_property_from_issue(
+                            issue, "quill-synced-comments-count"
+                        )
+                        if cached_comments_count is not None:
+                            try:
+                                setattr(issue, "_quill_cached_comments_count", int(cached_comments_count))
+                            except Exception:
+                                pass
                 if lookup:
                     return lookup
                 # Custom field returned nothing — could be field not set yet.
@@ -127,8 +198,8 @@ class JiraClient:
             issues = self.jira.search_issues(
                 fallback_jql,
                 maxResults=False,
-                fields="summary,description,status,labels",
-                properties="quill-content-hash,quill-github-url,quill-synced-labels",
+                fields="summary,description,status,labels,issuetype,parent",
+                properties="quill-content-hash,quill-github-url,quill-synced-labels,quill-synced-comments-count",
             )
         except Exception as exc:
             logger.warning(f"Fallback JQL also failed: {exc}")
@@ -137,6 +208,7 @@ class JiraClient:
         lookup = {}
         unresolved_issues = []  # issues where description parsing didn't find a URL
         for issue in issues:
+            setattr(issue, "_quill_cached_hash_checked", True)
             summary = getattr(issue.fields, "summary", "") or ""
             cached_hash = self.get_issue_property_from_issue(
                 issue, "quill-content-hash"
@@ -148,6 +220,14 @@ class JiraClient:
             )
             if cached_synced_labels is not None:
                 setattr(issue, "_quill_cached_synced_labels", cached_synced_labels)
+            cached_comments_count = self.get_issue_property_from_issue(
+                issue, "quill-synced-comments-count"
+            )
+            if cached_comments_count is not None:
+                try:
+                    setattr(issue, "_quill_cached_comments_count", int(cached_comments_count))
+                except Exception:
+                    pass
 
             # Primary: check pre-fetched entity property (zero HTTP cost)
             gh_url = self.get_issue_property_from_issue(issue, "quill-github-url")
@@ -233,6 +313,7 @@ class JiraClient:
         github_link_field: Optional[str] = None,
         github_url: Optional[str] = None,
         due_date: Optional[str] = None,
+        parent_key: Optional[str] = None,
     ) -> str:
         """Create a new issue in Jira.
 
@@ -248,6 +329,7 @@ class JiraClient:
             github_link_field: The custom field ID for storing the GitHub URL.
             github_url: The actual GitHub URL to store.
             due_date: Optional due date string in YYYY-MM-DD format.
+            parent_key: Optional Jira parent key when creating a Sub-task.
 
         Returns:
             The newly created issue key.
@@ -262,9 +344,25 @@ class JiraClient:
             # Jira labels cannot contain spaces.
             issue_dict["labels"] = [label.replace(" ", "-") for label in labels]
 
-        logger.info(f"Creating Jira issue in project {project}…")
-        new_issue = self.jira.create_issue(fields=issue_dict)
+        is_subtask_type = "sub-task" in issue_type.lower() or "subtask" in issue_type.lower()
+        if parent_key and is_subtask_type:
+            issue_dict["parent"] = {"key": parent_key}
+
+        logger.info(f"Creating Jira issue in project {project} (type: {issue_type})…")
+        try:
+            new_issue = self.jira.create_issue(fields=issue_dict)
+        except Exception as exc:
+            if is_subtask_type:
+                logger.warning(f"Could not create '{summary[:40]}' as Sub-task under {parent_key} ({exc}); falling back to standard Task…")
+                issue_dict["issuetype"] = {"name": "Task"}
+                issue_dict.pop("parent", None)
+                new_issue = self.jira.create_issue(fields=issue_dict)
+            else:
+                raise
         key = new_issue.key
+
+        if issue_type.lower() == "epic":
+            self.set_epic_name(key, summary)
 
         # Set the custom field via edit (bypasses create-screen restrictions)
         if github_link_field and github_url:
@@ -307,6 +405,164 @@ class JiraClient:
                 f"Ensure the Due Date field is enabled on the edit screen."
             )
 
+    def _get_issue_type_obj(self, type_name: str) -> Any | None:
+        """Helper to find an IssueType object by name."""
+        try:
+            for t in self.jira.issue_types():
+                if t.name.lower() == type_name.lower():
+                    return t
+        except Exception:
+            pass
+        return None
+
+    def update_issue_type(
+        self, issue_key: str, new_type: str, parent_key: Optional[str] = None
+    ) -> Union[bool, str]:
+        """Update an existing Jira issue's issue type (or re-create as sub-task and delete stale top-level task)."""
+        try:
+            issue = self.jira.issue(issue_key)
+            curr_type = getattr(getattr(issue.fields, "issuetype", None), "name", "")
+            if curr_type.lower() == new_type.lower():
+                return False
+            logger.info(f"Migrating issue type for {issue_key} from '{curr_type}' to '{new_type}'…")
+            if parent_key:
+                try:
+                    issue.update(fields={"parent": {"key": parent_key}})
+                except Exception as exc_p:
+                    logger.debug(f"Could not pre-set parent {parent_key} on {issue_key}: {exc_p}")
+            fields_to_update: dict[str, Any] = {"issuetype": {"name": new_type}}
+            new_type_obj = self._get_issue_type_obj(new_type)
+            if new_type_obj and getattr(new_type_obj, "id", None):
+                fields_to_update["issuetype"] = {"id": str(new_type_obj.id), "name": new_type}
+
+            if parent_key:
+                try:
+                    p_obj = self.jira.issue(parent_key)
+                    fields_to_update["parent"] = {"key": parent_key, "id": str(p_obj.id)}
+                except Exception:
+                    fields_to_update["parent"] = {"key": parent_key}
+
+            try:
+                issue.update(fields=fields_to_update)
+                if new_type.lower() == "epic":
+                    summary = getattr(issue.fields, "summary", str(issue_key))
+                    self.set_epic_name(issue_key, summary)
+                return True
+            except Exception as exc1:
+                if parent_key and new_type_obj and getattr(new_type_obj, "id", None):
+                    try:
+                        # Try legacy server fields (`parentIssueKey` / `parentIssueId`)
+                        p_id = fields_to_update.get("parent", {}).get("id")
+                        alt_fields = {"issuetype": {"id": str(new_type_obj.id)}}
+                        if p_id:
+                            alt_fields["parentIssueId"] = p_id
+                        else:
+                            alt_fields["parentIssueKey"] = parent_key
+                        issue.update(fields=alt_fields)
+                        return True
+                    except Exception:
+                        pass
+                raise exc1
+        except Exception as exc:
+            err_msg = getattr(exc, "text", str(exc)).split("\n")[0]
+            is_target_subtask = "sub-task" in new_type.lower() or "subtask" in new_type.lower()
+            if parent_key and is_target_subtask:
+                # Jira Server REST API forbids in-place conversion from top-level Task -> Sub-task across tiers.
+                # If delete_stale is enabled, re-create as true subtask under parent and delete old stale ticket!
+                new_key = self.recreate_as_subtask(
+                    old_issue_key=issue_key,
+                    new_type=new_type,
+                    parent_key=parent_key,
+                    github_link_field=getattr(self, "_last_github_link_field", None),
+                )
+                if new_key:
+                    return new_key
+                logger.debug(
+                    f"Note: {issue_key} is linked to parent {parent_key} via 'parent' field/hierarchy, "
+                    f"but Jira Server REST API prohibits converting top-level Task into a Sub-task ({err_msg})."
+                )
+            else:
+                logger.warning(f"Could not migrate issue type for {issue_key} to '{new_type}': {err_msg}")
+            return False
+
+    def delete_issue(self, issue_key: str) -> bool:
+        """Permanently delete an existing Jira issue."""
+        try:
+            issue = self.jira.issue(issue_key)
+            issue.delete()
+            logger.info(f"Deleted stale/legacy Jira issue {issue_key}")
+            return True
+        except Exception as exc:
+            err_msg = getattr(exc, "text", str(exc)).split("\n")[0]
+            logger.warning(f"Could not delete issue {issue_key}: {err_msg}")
+            return False
+
+    def recreate_as_subtask(
+        self,
+        old_issue_key: str,
+        new_type: str,
+        parent_key: str,
+        github_link_field: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Re-create an existing top-level Task as a Sub-task under parent_key and delete the stale old issue.
+        """
+        try:
+            logger.info(f"Re-creating {old_issue_key} as '{new_type}' under parent {parent_key} and deleting stale top-level issue…")
+            old_issue = self.jira.issue(old_issue_key)
+            summary = getattr(old_issue.fields, "summary", str(old_issue_key))
+            description = getattr(old_issue.fields, "description", "")
+            project = getattr(getattr(old_issue.fields, "project", None), "key", "GITHUB")
+            labels = getattr(old_issue.fields, "labels", [])
+            due_date = getattr(old_issue.fields, "duedate", None)
+
+            # Retrieve properties before deleting
+            gh_url = self.get_issue_property_from_issue(old_issue, "quill-github-url")
+            content_hash = self.get_issue_property_from_issue(old_issue, "quill-content-hash")
+            synced_labels = self.get_issue_property_from_issue(old_issue, "quill-synced-labels")
+
+            new_key = self.create_issue(
+                project=project,
+                summary=summary,
+                description=description,
+                issue_type=new_type,
+                labels=labels,
+                github_link_field=github_link_field,
+                github_url=gh_url,
+                due_date=due_date,
+                parent_key=parent_key,
+            )
+
+            if gh_url:
+                try:
+                    self.add_remote_link(
+                        issue_key=new_key,
+                        github_url=gh_url,
+                        title=f"GitHub #{gh_url.rstrip('/').split('/')[-1]}",
+                    )
+                except Exception as exc_rl:
+                    logger.debug(f"Could not add remote link on re-created {new_key}: {exc_rl}")
+
+            if content_hash:
+                self.set_issue_property(new_key, "quill-content-hash", content_hash)
+            if gh_url:
+                self.set_issue_property(new_key, "quill-github-url", gh_url)
+            if synced_labels:
+                self.set_issue_property(new_key, "quill-synced-labels", synced_labels)
+
+            # Delete the stale ticket rather than archiving
+            try:
+                old_issue.delete()
+                logger.info(f"Successfully re-created {old_issue_key} -> {new_key} and deleted stale top-level ticket.")
+            except Exception as exc_del:
+                logger.warning(f"Re-created {new_key}, but could not delete stale ticket {old_issue_key}: {exc_del}")
+
+            return new_key
+        except Exception as exc:
+            err_msg = getattr(exc, "text", str(exc)).split("\n")[0]
+            logger.warning(f"Could not re-create {old_issue_key} as sub-task: {err_msg}")
+            return None
+
     def update_issue(
         self,
         issue_key: str,
@@ -329,6 +585,9 @@ class JiraClient:
         issue = self.jira.issue(issue_key)
         issue.update(fields=fields)
 
+        if getattr(getattr(issue.fields, "issuetype", None), "name", "").lower() == "epic":
+            self.set_epic_name(issue_key, summary)
+
         if due_date:
             self.set_due_date(issue_key, due_date)
 
@@ -337,6 +596,7 @@ class JiraClient:
         issue_key: str,
         parent_key: str,
         epic_link_field: Optional[str] = "customfield_10014",
+        promote_to_epic: bool = True,
     ) -> bool:
         """Link an issue to its parent or epic in Jira.
 
@@ -366,39 +626,58 @@ class JiraClient:
             if getattr(curr_epic, "key", None) == parent_key or str(curr_epic) == parent_key:
                 return False
 
-        # Check if parent is an Epic before linking; if not, attempt to promote it to Epic so GreenHopper / Agile API can link issues to it.
+        # Check if parent is an Epic before linking; if not, attempt to promote it ONLY when promote_to_epic is True
+        is_parent_epic = False
         try:
             parent_issue = self.jira.issue(parent_key)
             parent_type = getattr(getattr(parent_issue.fields, "issuetype", None), "name", "")
-            if parent_type.lower() != "epic":
+            parent_summary = getattr(parent_issue.fields, "summary", "") or f"{parent_key}"
+            if parent_type.lower() == "epic":
+                is_parent_epic = True
+                # Ensure its Epic Name custom field is populated cleanly
+                self.set_epic_name(parent_key, parent_summary)
+            elif promote_to_epic:
                 logger.info(f"Parent issue {parent_key} currently has issue type '{parent_type}' (not 'Epic'). Promoting to 'Epic' so Epic Link / Agile hierarchy works…")
                 try:
                     parent_issue.update(fields={"issuetype": {"name": "Epic"}})
                     logger.info(f"Successfully promoted {parent_key} to issue type 'Epic'.")
+                    self.set_epic_name(parent_key, parent_summary)
+                    is_parent_epic = True
                 except Exception as exc_up:
                     logger.debug(f"Could not automatically promote {parent_key} to 'Epic' ({exc_up}). Epic Link attempts may fail if parent must be an Epic.")
+            else:
+                logger.debug(f"Parent issue {parent_key} has issue type '{parent_type}'. Skipping Epic promotion to preserve strict Task/Sub-task hierarchy.")
         except Exception as exc_pf:
             logger.debug(f"Could not inspect parent issue {parent_key}: {exc_pf}")
 
+        # Check if child issue itself is currently an Epic (an Epic cannot be added to another Epic via Epic Link)
+        child_type = getattr(getattr(issue.fields, "issuetype", None), "name", "").lower()
+        if child_type == "epic":
+            logger.debug(f"Child issue {issue_key} is currently an Epic. Skipping Attempt 1 (Epic Link) and linking via native parent field / issue link.")
+            is_parent_epic = False
+            promote_to_epic = False
+
         # Attempt 1: Epic Link / Agile API (required for Epics on Jira Data Center, Server, & Cloud Classic)
+        # Only run Attempt 1 if the target parent is actually an Epic or we attempted promoting it
         epic_linked = False
-
-        # 1a. Try Jira Agile / Software REST API (`add_issues_to_epic`) directly
-        try:
-            self.jira.add_issues_to_epic(epic_id=parent_key, issue_keys=[issue_key])
-            logger.info(f"Linked {issue_key} to epic {parent_key} via Jira Agile API")
-            epic_linked = True
-        except Exception as exc_agile:
-            logger.debug(f"Could not link {issue_key} -> {parent_key} via Agile API ({exc_agile}); trying custom field '{epic_field_id}'…")
-
-        # 1b. Try Epic Link custom field (`epic_field_id`) via standard REST API
-        if not epic_linked and epic_field_id:
+        if is_parent_epic or promote_to_epic:
+            # 1a. Try Jira Agile / Software REST API (`add_issues_to_epic`) directly
             try:
-                issue.update(fields={epic_field_id: parent_key})
-                logger.info(f"Linked {issue_key} to epic {parent_key} via '{epic_field_id}'")
+                self.jira.add_issues_to_epic(epic_id=parent_key, issue_keys=[issue_key])
+                logger.info(f"Linked {issue_key} to epic {parent_key} via Jira Agile API")
                 epic_linked = True
-            except Exception as exc_cf:
-                logger.info(f"Could not link {issue_key} -> {parent_key} via Epic Link field '{epic_field_id}' ({exc_cf}); trying native 'parent' field…")
+            except Exception as exc_agile:
+                logger.debug(f"Could not link {issue_key} -> {parent_key} via Agile API ({exc_agile}); trying custom field '{epic_field_id}'…")
+
+            # 1b. Try Epic Link custom field (`epic_field_id`) via standard REST API
+            if not epic_linked and epic_field_id:
+                try:
+                    issue.update(fields={epic_field_id: parent_key})
+                    logger.info(f"Linked {issue_key} to epic {parent_key} via '{epic_field_id}'")
+                    epic_linked = True
+                except Exception as exc_cf:
+                    err_msg = getattr(exc_cf, "text", str(exc_cf)).split("\n")[0]
+                    logger.info(f"Could not link {issue_key} -> {parent_key} via Epic Link field '{epic_field_id}' ({err_msg}); trying native 'parent' field…")
 
         if epic_linked:
             # Also attempt setting native 'parent' field for universal compatibility across Jira Cloud views

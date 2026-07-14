@@ -1,5 +1,7 @@
 import concurrent.futures
+import os
 import re
+import threading
 from typing import Optional, Any
 from rich.console import Console
 from rich.panel import Panel
@@ -37,7 +39,17 @@ class SyncEngine:
             verify_ssl=config.jira_verify_ssl,
         )
 
-    # ── Public API ────────────────────────────────────────────────────────
+    def _get_max_workers(self, task_count: int) -> int:
+        """Determine worker thread count capped by config concurrency and available CPU cores."""
+        if task_count <= 1:
+            return 1
+        configured = getattr(self.config, "sync_concurrency", 4)
+        cpus = os.cpu_count() or 1
+        # Cap by configured concurrency, and also cap by vCPUs if vCPUs is below configured value
+        worker_limit = min(configured, cpus) if cpus < configured else configured
+        return max(1, min(worker_limit, task_count))
+
+    # ── Orchestrator ────────────────────────────────────────────────────────
 
     def sync_all(self, repo_override: Optional[str] = None, force: bool = False):
         """Sync all configured repositories or a specific one.
@@ -107,7 +119,7 @@ class SyncEngine:
                 )
                 return rc.full_name, (iss, p_fields, p_parents)
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(repos))) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self._get_max_workers(len(repos))) as executor:
                 for full_name, data in executor.map(_fetch_gh, repos):
                     gh_data_cache[full_name] = data
 
@@ -216,9 +228,21 @@ class SyncEngine:
             "comments": 0,
             "errors": 0,
         }
-        pending_parent_links: dict[str, tuple[str, str]] = {}
+        level1_epics, level2_tasks, level3_subtasks = self._classify_hierarchy_levels(gh_issues, repo_parents)
+        def _tier_sort_key(iss: Any) -> int:
+            if iss.number in level1_epics:
+                return 1
+            if iss.number in level2_tasks:
+                return 2
+            if iss.number in level3_subtasks:
+                return 3
+            return 2
+        gh_issues.sort(key=_tier_sort_key)
 
-        for issue in gh_issues:
+        pending_parent_links: dict[str, tuple[str, str, bool]] = {}
+
+        stats_lock = threading.Lock()
+        def _process_single_issue(issue: Any):
             try:
                 self._sync_issue(
                     rc,
@@ -230,12 +254,20 @@ class SyncEngine:
                     repo_project_fields=repo_project_fields,
                     repo_parents=repo_parents,
                     pending_parent_links=pending_parent_links,
+                    level1_epics=level1_epics,
+                    level2_tasks=level2_tasks,
+                    level3_subtasks=level3_subtasks,
+                    stats_lock=stats_lock,
                 )
             except Exception as exc:
-                stats["errors"] += 1
+                with stats_lock:
+                    stats["errors"] += 1
                 logger.error(
                     f"Error syncing issue #{issue.number} ({issue.title}): {exc}"
                 )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self._get_max_workers(len(gh_issues))) as executor:
+            list(executor.map(_process_single_issue, gh_issues))
 
         # Step 3 — sync parent/epic relationships after all issues in repo are processed
         self._sync_parent_relationships(rc, pending_parent_links, existing_lookup, dry_run)
@@ -246,6 +278,46 @@ class SyncEngine:
             f"Skipped={stats['skipped']}  Comments={stats['comments']}  "
             f"Errors={stats['errors']}"
         )
+
+    @staticmethod
+    def _classify_hierarchy_levels(
+        gh_issues: list[Any],
+        repo_parents: Optional[dict[int, str]],
+    ) -> tuple[set[int], set[int], set[int]]:
+        """Classify issues in a repo into Level 1 (Epics), Level 2 (Tasks), and Level 3 (Sub-tasks)."""
+        level1_epics: set[int] = set()
+        level2_tasks: set[int] = set()
+        level3_subtasks: set[int] = set()
+
+        if not repo_parents:
+            return level1_epics, level2_tasks, level3_subtasks
+
+        child_numbers = set(repo_parents.keys())
+        parent_numbers: set[int] = set()
+        for child_num, pref in repo_parents.items():
+            clean_num = re.sub(r"[^0-9]", "", pref.split("/")[-1] if "/" in pref else pref)
+            if clean_num and clean_num.isdigit():
+                parent_numbers.add(int(clean_num))
+
+        for issue in gh_issues:
+            num = issue.number
+            has_parent = num in child_numbers
+            has_children = num in parent_numbers
+
+            if has_children and not has_parent:
+                level1_epics.add(num)
+            elif has_children and has_parent:
+                level2_tasks.add(num)
+            elif has_parent and not has_children:
+                pref = repo_parents.get(num, "")
+                clean_p = re.sub(r"[^0-9]", "", pref.split("/")[-1] if "/" in pref else pref)
+                p_num = int(clean_p) if clean_p and clean_p.isdigit() else -1
+                if p_num in parent_numbers and (p_num in child_numbers):
+                    level3_subtasks.add(num)
+                else:
+                    level2_tasks.add(num)
+
+        return level1_epics, level2_tasks, level3_subtasks
 
     # ── Per-issue sync ────────────────────────────────────────────────────
 
@@ -259,8 +331,19 @@ class SyncEngine:
         stats: dict[str, int],
         repo_project_fields: Optional[dict[int, dict[str, str]]] = None,
         repo_parents: Optional[dict[int, str]] = None,
-        pending_parent_links: Optional[dict[str, tuple[str, str]]] = None,
+        pending_parent_links: Optional[dict[str, Any]] = None,
+        level1_epics: Optional[set[int]] = None,
+        level2_tasks: Optional[set[int]] = None,
+        level3_subtasks: Optional[set[int]] = None,
+        stats_lock: Optional[Any] = None,
     ):
+        """Process a single GitHub issue: create or update corresponding Jira issue."""
+        def _inc_stat(k: str):
+            if stats_lock:
+                with stats_lock:
+                    stats[k] += 1
+            else:
+                stats[k] += 1
         gh_url: str = issue.html_url
         issue_labels = [label.name for label in issue.labels]
 
@@ -359,13 +442,26 @@ class SyncEngine:
                 )
 
         target_issue_type = self.config.jira_default_issue_type
-        if any(lbl.lower() == "epic" for lbl in issue_labels):
+        if level1_epics and issue.number in level1_epics:
+            target_issue_type = "Epic"
+        elif any(lbl.lower() == "epic" for lbl in issue_labels):
             target_issue_type = "Epic"
         elif repo_project_fields and issue.number in repo_project_fields:
             for k, v in repo_project_fields[issue.number].items():
                 if k.lower() in ("type", "issue type", "kind") and str(v).lower() == "epic":
                     target_issue_type = "Epic"
                     break
+
+        parent_jira_key_for_create = None
+        if level3_subtasks and issue.number in level3_subtasks:
+            parent_ref_for_subtask = None
+            if repo_parents and issue.number in repo_parents:
+                parent_ref_for_subtask = repo_parents[issue.number]
+            if parent_ref_for_subtask:
+                p_key = self._resolve_parent_jira_key(parent_ref_for_subtask, lookup, rc.jira_project)
+                if p_key:
+                    target_issue_type = self.jira_client.discover_subtask_issue_type()
+                    parent_jira_key_for_create = p_key
 
         if jira_issue is None:
             # ── NEW ──────────────────────────────────────────────────
@@ -380,6 +476,7 @@ class SyncEngine:
                     github_link_field=github_link_field,
                     github_url=gh_url,
                     due_date=due_date_str,
+                    parent_key=parent_jira_key_for_create,
                 )
                 self.jira_client.add_remote_link(
                     issue_key=jira_key,
@@ -396,6 +493,13 @@ class SyncEngine:
                 self.jira_client.set_issue_property(
                     jira_key, "quill-synced-labels", all_labels
                 )
+                if lookup is not None:
+                    import types
+                    if stats_lock:
+                        with stats_lock:
+                            lookup[gh_url] = types.SimpleNamespace(key=jira_key)
+                    else:
+                        lookup[gh_url] = types.SimpleNamespace(key=jira_key)
                 logger.info(f"Created {jira_key} for GH #{issue.number}")
             else:
                 jira_key = None
@@ -409,11 +513,34 @@ class SyncEngine:
                     gh_url=gh_url,
                     description=jira_description,
                 )
-            stats["created"] += 1
+            _inc_stat("created")
 
         else:
             # ── EXISTS — check for changes ─────────────────────────────────
             jira_key = jira_issue.key
+
+            # Check if issue type migration is needed (e.g., demoting Epic to Task or converting to Sub-task)
+            curr_issue_type = getattr(getattr(jira_issue.fields, "issuetype", None), "name", "")
+            if curr_issue_type and target_issue_type and curr_issue_type.lower() != target_issue_type.lower():
+                is_target_subtask = "sub-task" in target_issue_type.lower() or "subtask" in target_issue_type.lower()
+                if not (is_target_subtask and not parent_jira_key_for_create):
+                    if not dry_run:
+                        res_type = self.jira_client.update_issue_type(jira_key, target_issue_type, parent_key=parent_jira_key_for_create)
+                        if isinstance(res_type, str):
+                            jira_key = res_type
+                            try:
+                                jira_issue = self.jira_client.jira.issue(jira_key)
+                            except Exception:
+                                pass
+                            if lookup is not None:
+                                import types
+                                if stats_lock:
+                                    with stats_lock:
+                                        lookup[gh_url] = types.SimpleNamespace(key=jira_key)
+                                else:
+                                    lookup[gh_url] = types.SimpleNamespace(key=jira_key)
+                    else:
+                        logger.info(f"[Dry Run] Would migrate {jira_key} issue type from '{curr_issue_type}' to '{target_issue_type}'")
 
             # Primary: read hash from pre-fetched cache or issue property (zero HTTP cost)
             existing_hash = getattr(jira_issue, "_quill_cached_hash", None)
@@ -429,8 +556,8 @@ class SyncEngine:
                 )
                 if existing_hash is not None:
                     setattr(jira_issue, "_quill_cached_hash", existing_hash)
-            # Fallback: query Jira entity property
-            if existing_hash is None:
+            # Fallback: query Jira entity property ONLY if not batch-checked during pre-fetch
+            if existing_hash is None and not getattr(jira_issue, "_quill_cached_hash_checked", False):
                 existing_hash = self.jira_client.get_issue_property(
                     jira_key, "quill-content-hash"
                 )
@@ -476,10 +603,10 @@ class SyncEngine:
                         description=jira_description,
                         jira_key=jira_key,
                     )
-                stats["updated"] += 1
+                _inc_stat("updated")
             else:
                 logger.debug(f"Issue #{issue.number} unchanged → skip.")
-                stats["skipped"] += 1
+                _inc_stat("skipped")
 
         # ── State transition (close) ─────────────────────────────────
         if issue.state == "closed":
@@ -518,12 +645,22 @@ class SyncEngine:
                         parent_ref = v
                         break
             if parent_ref and (jira_key or dry_run) and pending_parent_links is not None:
-                pending_parent_links[gh_url] = (jira_key or f"GH #{issue.number}", parent_ref)
+                promote_flag = True
+                clean_p = re.sub(r"[^0-9]", "", parent_ref.split("/")[-1] if "/" in parent_ref else parent_ref)
+                p_num = int(clean_p) if clean_p and clean_p.isdigit() else -1
+                if (level3_subtasks and issue.number in level3_subtasks) or (level2_tasks and p_num in level2_tasks):
+                    promote_flag = False
+                if pending_parent_links is not None:
+                    if stats_lock:
+                        with stats_lock:
+                            pending_parent_links[gh_url] = (jira_key or f"GH #{issue.number}", parent_ref, promote_flag)
+                    else:
+                        pending_parent_links[gh_url] = (jira_key or f"GH #{issue.number}", parent_ref, promote_flag)
 
         # ── Comment sync ─────────────────────────────────────────────
         if rc.sync_comments and getattr(issue, "comments", 0) > 0:
             if jira_key:
-                self._sync_comments(rc, issue, jira_key, dry_run, stats)
+                self._sync_comments(rc, issue, jira_key, dry_run, stats, jira_issue=jira_issue, force=force, stats_lock=stats_lock)
             elif dry_run:
                 logger.info(f"[Dry Run] Would sync comments for NEW-ISSUE(#{issue.number})")
 
@@ -665,33 +802,52 @@ class SyncEngine:
     def _sync_parent_relationships(
         self,
         rc: GitHubRepoConfig,
-        pending_parent_links: dict[str, tuple[str, str]],
+        pending_parent_links: dict[str, Any],
         lookup: dict[str, Any],
         dry_run: bool,
     ):
         if not getattr(rc, "sync_parent_links", True) or not pending_parent_links:
             return
 
-        logger.info(f"Syncing parent/epic relationships for {len(pending_parent_links)} issues in {rc.full_name}…")
-        for child_gh_url, (child_jira_key, parent_ref) in pending_parent_links.items():
+        logger.info(f"Syncing parent/epic relationships for {len(pending_parent_links)} issues in {rc.full_name} in parallel…")
+        def _process_parent_link(item: tuple[str, Any]):
+            child_gh_url, link_tuple = item
+            child_jira_key, parent_ref = link_tuple[0], link_tuple[1]
+            promote_to_epic = link_tuple[2] if len(link_tuple) > 2 else True
             parent_jira_key = self._resolve_parent_jira_key(
                 parent_ref, lookup, rc.jira_project
             )
             if not parent_jira_key:
                 if not dry_run:
                     logger.debug(f"Could not resolve Jira key for parent reference '{parent_ref}' of {child_jira_key}")
-                continue
+                return
 
             if not dry_run:
                 self.jira_client.set_parent_issue(
                     issue_key=child_jira_key,
                     parent_key=parent_jira_key,
                     epic_link_field=self.config.jira_epic_link_field,
+                    promote_to_epic=promote_to_epic,
                 )
             else:
                 logger.info(
-                    f"[Dry Run] Would link {child_jira_key} to parent/epic {parent_jira_key}"
+                    f"[Dry Run] Would link {child_jira_key} to parent/epic {parent_jira_key} (promote={promote_to_epic})"
                 )
+
+            if not promote_to_epic and parent_jira_key:
+                subtask_type = self.jira_client.discover_subtask_issue_type()
+                if not dry_run:
+                    res_type = self.jira_client.update_issue_type(child_jira_key, subtask_type, parent_key=parent_jira_key)
+                    if isinstance(res_type, str):
+                        import types
+                        child_jira_key = res_type
+                        if lookup is not None:
+                            lookup[child_gh_url] = types.SimpleNamespace(key=child_jira_key)
+                else:
+                    logger.info(f"[Dry Run] Would migrate {child_jira_key} issue type to sub-task '{subtask_type}' with parent {parent_jira_key}")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self._get_max_workers(len(pending_parent_links))) as executor:
+            list(executor.map(_process_parent_link, pending_parent_links.items()))
 
     # ── Comment sync ──────────────────────────────────────────────────────
 
@@ -702,7 +858,22 @@ class SyncEngine:
         jira_key: str,
         dry_run: bool,
         stats: dict[str, int],
+        jira_issue: Any = None,
+        force: bool = False,
+        stats_lock: Optional[Any] = None,
     ):
+        def _inc_stat(k: str):
+            if stats_lock:
+                with stats_lock:
+                    stats[k] += 1
+            else:
+                stats[k] += 1
+
+        if not force and jira_issue is not None:
+            cached_cnt = getattr(jira_issue, "_quill_cached_comments_count", None)
+            if cached_cnt is not None and cached_cnt == getattr(issue, "comments", 0):
+                return
+
         existing_jira_comments: list[str] = []
         if not dry_run:
             try:
@@ -735,7 +906,15 @@ class SyncEngine:
                         f"[Dry Run] Would add comment by @{comment.user.login} "
                         f"to {jira_key}"
                     )
-                stats["comments"] += 1
+                _inc_stat("comments")
+
+        if not dry_run:
+            try:
+                self.jira_client.set_issue_property(
+                    jira_key, "quill-synced-comments-count", str(getattr(issue, "comments", 0))
+                )
+            except Exception:
+                pass
 
     # ── Status query (for CLI `status` command) ───────────────────────────
 
