@@ -27,6 +27,21 @@ class JiraClient:
         user = self.jira.myself()
         return user.get("displayName", "Authenticated User")
 
+    def discover_epic_link_field_id(self, default: Optional[str] = "customfield_10014") -> Optional[str]:
+        """Dynamically discover the real custom field ID for 'Epic Link' on this Jira server."""
+        if hasattr(self, "_discovered_epic_link_field") and self._discovered_epic_link_field is not None:
+            return self._discovered_epic_link_field
+        try:
+            for f in self.jira.fields():
+                if f.get("name") == "Epic Link" and f.get("id", "").startswith("customfield_"):
+                    self._discovered_epic_link_field = f["id"]
+                    logger.debug(f"Discovered Epic Link custom field ID: {self._discovered_epic_link_field}")
+                    return self._discovered_epic_link_field
+        except Exception as exc:
+            logger.debug(f"Could not query Jira field metadata ({exc}); using default {default}")
+        self._discovered_epic_link_field = default
+        return self._discovered_epic_link_field
+
     # ── Stateless lookup via JQL ──────────────────────────────────────────
 
     @staticmethod
@@ -325,9 +340,9 @@ class JiraClient:
     ) -> bool:
         """Link an issue to its parent or epic in Jira.
 
-        Attempts native 'parent' field first (modern Jira Cloud & subtasks), then
-        falls back to 'Epic Link' custom field (Jira Server/Data Center epics),
-        and finally creates a 'Parent / Child' or 'Epic-Story Link' issue link.
+        Attempts 'Epic Link' custom field first (`customfield_10014`), then falls back
+        to native 'parent' field (for subtasks & Team-Managed Cloud projects), and
+        finally creates an Issue Link ('Parent / Child', 'Epic-Story Link', or 'Relates').
         """
         if issue_key == parent_key:
             return False
@@ -345,24 +360,53 @@ class JiraClient:
             return False
 
         # Check if already linked via epic link field
-        if epic_link_field:
-            curr_epic = getattr(issue.fields, epic_link_field, None)
+        epic_field_id = self.discover_epic_link_field_id(epic_link_field)
+        if epic_field_id:
+            curr_epic = getattr(issue.fields, epic_field_id, None)
             if getattr(curr_epic, "key", None) == parent_key or str(curr_epic) == parent_key:
                 return False
 
-        # Attempt 1: Epic Link custom field (required for Epics on Jira Data Center, Server, & Cloud Classic)
-        if epic_link_field:
-            try:
-                issue.update(fields={epic_link_field: parent_key})
-                logger.info(f"Linked {issue_key} to epic {parent_key} via '{epic_link_field}'")
-                # Also attempt setting native 'parent' field for universal compatibility across Jira Cloud views
+        # Check if parent is an Epic before linking; if not, attempt to promote it to Epic so GreenHopper / Agile API can link issues to it.
+        try:
+            parent_issue = self.jira.issue(parent_key)
+            parent_type = getattr(getattr(parent_issue.fields, "issuetype", None), "name", "")
+            if parent_type.lower() != "epic":
+                logger.info(f"Parent issue {parent_key} currently has issue type '{parent_type}' (not 'Epic'). Promoting to 'Epic' so Epic Link / Agile hierarchy works…")
                 try:
-                    issue.update(fields={"parent": {"key": parent_key}})
-                except Exception:
-                    pass
-                return True
-            except Exception as exc1:
-                logger.debug(f"Could not link {issue_key} -> {parent_key} via '{epic_link_field}' ({exc1}); trying 'parent' field…")
+                    parent_issue.update(fields={"issuetype": {"name": "Epic"}})
+                    logger.info(f"Successfully promoted {parent_key} to issue type 'Epic'.")
+                except Exception as exc_up:
+                    logger.debug(f"Could not automatically promote {parent_key} to 'Epic' ({exc_up}). Epic Link attempts may fail if parent must be an Epic.")
+        except Exception as exc_pf:
+            logger.debug(f"Could not inspect parent issue {parent_key}: {exc_pf}")
+
+        # Attempt 1: Epic Link / Agile API (required for Epics on Jira Data Center, Server, & Cloud Classic)
+        epic_linked = False
+
+        # 1a. Try Jira Agile / Software REST API (`add_issues_to_epic`) directly
+        try:
+            self.jira.add_issues_to_epic(epic_id=parent_key, issue_keys=[issue_key])
+            logger.info(f"Linked {issue_key} to epic {parent_key} via Jira Agile API")
+            epic_linked = True
+        except Exception as exc_agile:
+            logger.debug(f"Could not link {issue_key} -> {parent_key} via Agile API ({exc_agile}); trying custom field '{epic_field_id}'…")
+
+        # 1b. Try Epic Link custom field (`epic_field_id`) via standard REST API
+        if not epic_linked and epic_field_id:
+            try:
+                issue.update(fields={epic_field_id: parent_key})
+                logger.info(f"Linked {issue_key} to epic {parent_key} via '{epic_field_id}'")
+                epic_linked = True
+            except Exception as exc_cf:
+                logger.info(f"Could not link {issue_key} -> {parent_key} via Epic Link field '{epic_field_id}' ({exc_cf}); trying native 'parent' field…")
+
+        if epic_linked:
+            # Also attempt setting native 'parent' field for universal compatibility across Jira Cloud views
+            try:
+                issue.update(fields={"parent": {"key": parent_key}})
+            except Exception:
+                pass
+            return True
 
         # Attempt 2: native 'parent' field (for subtasks, Team-Managed Cloud projects, or Parent Link)
         try:

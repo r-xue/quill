@@ -358,15 +358,24 @@ class SyncEngine:
                     f"(customfield fallback)."
                 )
 
+        target_issue_type = self.config.jira_default_issue_type
+        if any(lbl.lower() == "epic" for lbl in issue_labels):
+            target_issue_type = "Epic"
+        elif repo_project_fields and issue.number in repo_project_fields:
+            for k, v in repo_project_fields[issue.number].items():
+                if k.lower() in ("type", "issue type", "kind") and str(v).lower() == "epic":
+                    target_issue_type = "Epic"
+                    break
+
         if jira_issue is None:
             # ── NEW ──────────────────────────────────────────────────
-            logger.info(f"Issue #{issue.number} is new. Creating in Jira…")
+            logger.info(f"Issue #{issue.number} is new. Creating in Jira (type: {target_issue_type})…")
             if not dry_run:
                 jira_key = self.jira_client.create_issue(
                     project=rc.jira_project,
                     summary=summary,
                     description=jira_description,
-                    issue_type=self.config.jira_default_issue_type,
+                    issue_type=target_issue_type,
                     labels=all_labels,
                     github_link_field=github_link_field,
                     github_url=gh_url,
@@ -394,7 +403,7 @@ class SyncEngine:
                     action="CREATE",
                     project=rc.jira_project,
                     summary=summary,
-                    issue_type=self.config.jira_default_issue_type,
+                    issue_type=target_issue_type,
                     labels=all_labels,
                     gh_state=issue.state,
                     gh_url=gh_url,
