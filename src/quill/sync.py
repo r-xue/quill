@@ -258,7 +258,9 @@ class SyncEngine:
             "comments": 0,
             "errors": 0,
         }
-        level1_epics, level2_tasks, level3_subtasks = self._classify_hierarchy_levels(gh_issues, repo_parents, current_repo_full_name=rc.full_name)
+        level1_epics, level2_tasks, level3_subtasks = self._classify_hierarchy_levels(
+            gh_issues, repo_parents, current_repo_full_name=rc.full_name, repo_project_fields=repo_project_fields
+        )
         def _tier_sort_key(iss: Any) -> int:
             if iss.number in level1_epics:
                 return 1
@@ -299,21 +301,16 @@ class SyncEngine:
         with concurrent.futures.ThreadPoolExecutor(max_workers=self._get_max_workers(len(gh_issues))) as executor:
             list(executor.map(_process_single_issue, gh_issues))
 
-        # Step 3 — sync parent/epic relationships after all issues in repo are processed
+        # Step 4 — sync parent relationships
         self._sync_parent_relationships(rc, pending_parent_links, existing_lookup, dry_run)
-
-        logger.info(
-            f"[bold green]Done {rc.full_name}:[/bold green] "
-            f"Created={stats['created']}  Updated={stats['updated']}  "
-            f"Skipped={stats['skipped']}  Comments={stats['comments']}  "
-            f"Errors={stats['errors']}"
-        )
+        return stats
 
     @staticmethod
     def _classify_hierarchy_levels(
         gh_issues: list[Any],
         repo_parents: Optional[dict[int, str]],
         current_repo_full_name: Optional[str] = None,
+        repo_project_fields: Optional[dict[int, dict[str, str]]] = None,
     ) -> tuple[set[int], set[int], set[int]]:
         """Classify issues in a repo into Level 1 (Epics), Level 2 (Tasks), and Level 3 (Sub-tasks)."""
         level1_epics: set[int] = set()
@@ -321,10 +318,25 @@ class SyncEngine:
         level3_subtasks: set[int] = set()
 
         if not repo_parents:
+            # If there's no parent hierarchy, check for explicit Epic labels/fields or default to Task
+            for issue in gh_issues:
+                num = issue.number
+                labels = [getattr(lbl, "name", str(lbl)) for lbl in getattr(issue, "labels", [])]
+                if any(lbl.lower() == "epic" for lbl in labels):
+                    level1_epics.add(num)
+                elif repo_project_fields and num in repo_project_fields and any(
+                    k.lower() in ("type", "issue type", "kind") and str(v).lower() == "epic"
+                    for k, v in repo_project_fields[num].items()
+                ):
+                    level1_epics.add(num)
+                else:
+                    level2_tasks.add(num)
             return level1_epics, level2_tasks, level3_subtasks
 
-        child_numbers = set(repo_parents.keys())
         parent_numbers: set[int] = set()
+        child_numbers: set[int] = set(repo_parents.keys())
+        children_by_parent: dict[int, set[int]] = {}
+
         for child_num, pref in repo_parents.items():
             if not pref:
                 continue
@@ -335,25 +347,68 @@ class SyncEngine:
                     continue
             clean_num = re.sub(r"[^0-9]", "", pref.split("/")[-1] if "/" in pref else pref)
             if clean_num and clean_num.isdigit():
-                parent_numbers.add(int(clean_num))
+                p_num = int(clean_num)
+                parent_numbers.add(p_num)
+                children_by_parent.setdefault(p_num, set()).add(child_num)
 
+        # Pass 1: Identify Level 1 Epics
+        # An issue is classified as a Level 1 Epic if:
+        # 1. It explicitly has an 'epic' label or project field
+        # 2. It has children and no parent inside the repository (root container)
+        # 3. It has children AND any of its children also have children (i.e. depth >= 3 tree where this node is the container)
         for issue in gh_issues:
             num = issue.number
             has_parent = num in child_numbers
             has_children = num in parent_numbers
 
-            if has_children and not has_parent:
+            labels = [getattr(lbl, "name", str(lbl)) for lbl in getattr(issue, "labels", [])]
+            is_explicit_epic = any(lbl.lower() == "epic" for lbl in labels)
+            if not is_explicit_epic and repo_project_fields and num in repo_project_fields:
+                for k, v in repo_project_fields[num].items():
+                    if k.lower() in ("type", "issue type", "kind") and str(v).lower() == "epic":
+                        is_explicit_epic = True
+                        break
+
+            if is_explicit_epic or (has_children and not has_parent):
                 level1_epics.add(num)
-            elif has_children and has_parent:
+            elif has_children and any(c in parent_numbers for c in children_by_parent.get(num, set())):
+                level1_epics.add(num)
+
+        # Pass 2: Classify Level 2 Tasks vs Level 3 Sub-tasks consistently by parent tier
+        for issue in gh_issues:
+            num = issue.number
+            if num in level1_epics:
+                continue
+
+            has_parent = num in child_numbers
+            has_children = num in parent_numbers
+
+            if not has_parent:
                 level2_tasks.add(num)
-            elif has_parent and not has_children:
-                pref = repo_parents.get(num, "")
-                clean_p = re.sub(r"[^0-9]", "", pref.split("/")[-1] if "/" in pref else pref)
-                p_num = int(clean_p) if clean_p and clean_p.isdigit() else -1
-                if p_num in parent_numbers and (p_num in child_numbers):
-                    level3_subtasks.add(num)
-                else:
-                    level2_tasks.add(num)
+                continue
+
+            pref = repo_parents.get(num, "")
+            clean_p = re.sub(r"[^0-9]", "", pref.split("/")[-1] if "/" in pref else pref)
+            p_num = int(clean_p) if clean_p and clean_p.isdigit() else -1
+
+            if p_num in level1_epics:
+                # Direct children of Epics MUST always be Level 2 Tasks
+                level2_tasks.add(num)
+            elif has_children:
+                # If this node itself has children (and parent wasn't Level 1 Epic), treat as Level 2 Task
+                # and promote parent to Level 1 Epic so all siblings are at Level 2 Tasks
+                level2_tasks.add(num)
+                if p_num != -1:
+                    level1_epics.add(p_num)
+                    # Also move any already-processed siblings under p_num from level3_subtasks to level2_tasks
+                    for sibling in children_by_parent.get(p_num, set()):
+                        if sibling in level3_subtasks:
+                            level3_subtasks.remove(sibling)
+                            level2_tasks.add(sibling)
+            elif p_num in level2_tasks or (p_num in parent_numbers and p_num in child_numbers):
+                level3_subtasks.add(num)
+            else:
+                level2_tasks.add(num)
 
         return level1_epics, level2_tasks, level3_subtasks
 

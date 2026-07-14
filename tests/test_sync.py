@@ -81,14 +81,16 @@ class TestJiraClientEmptyField:
             mock_jira_inst.search_issues.assert_called_once()
             called_jql = mock_jira_inst.search_issues.call_args[0][0]
             assert 'labels = "github-synced"' in called_jql
-            assert mock_jira_inst.search_issues.call_args[1]["fields"] == "summary,description,status"
-            assert mock_jira_inst.search_issues.call_args[1]["properties"] == "quill-content-hash,quill-github-url"
+            assert mock_jira_inst.search_issues.call_args[1]["fields"] == "summary,description,status,labels,issuetype,parent"
+            assert mock_jira_inst.search_issues.call_args[1]["properties"] == "quill-content-hash,quill-github-url,quill-synced-labels,quill-synced-comments-count"
             assert lookup == {"https://github.com/your-org/your-repo/issues/1": mock_issue}
 
 
+@patch("quill.sync.JiraClient")
+@patch("quill.sync.GitHubClient")
 class TestClosedIssueSync:
     @patch("quill.sync.compute_content_hash", return_value="hash123")
-    def test_sync_closed_issue_without_status_attribute(self, mock_hash, v2_config):
+    def test_sync_closed_issue_without_status_attribute(self, mock_hash, mock_gh_cls, mock_jira_cls, v2_config):
         """Ensure syncing a closed issue doesn't crash if jira_issue.fields has no status attribute."""
         engine = SyncEngine(v2_config)
         
@@ -96,6 +98,7 @@ class TestClosedIssueSync:
         mock_gh_issue.number = 1
         mock_gh_issue.html_url = "https://github.com/your-org/your-repo/issues/1"
         mock_gh_issue.labels = []
+        mock_gh_issue.milestone = None
         mock_gh_issue.state = "closed"
         mock_gh_issue.title = "Closed Issue"
         mock_gh_issue.body = "Body"
@@ -125,8 +128,10 @@ class TestClosedIssueSync:
         assert stats["errors"] == 0
 
 
+@patch("quill.sync.JiraClient")
+@patch("quill.sync.GitHubClient")
 class TestProjectFieldsSync:
-    def test_sync_project_fields_to_labels_and_panel(self, v2_config):
+    def test_sync_project_fields_to_labels_and_panel(self, mock_gh_cls, mock_jira_cls, v2_config):
         """Verify GitHub Projects V2 fields are converted to structured Jira labels and added to panel."""
         v2_config.repos[0].sync_project_fields = True
         engine = SyncEngine(v2_config)
@@ -135,6 +140,7 @@ class TestProjectFieldsSync:
         mock_gh_issue.number = 42
         mock_gh_issue.html_url = "https://github.com/your-org/your-repo/issues/42"
         mock_gh_issue.labels = []
+        mock_gh_issue.milestone = None
         mock_gh_issue.state = "open"
         mock_gh_issue.title = "Project Issue"
         mock_gh_issue.body = "Some description"
@@ -161,8 +167,10 @@ class TestProjectFieldsSync:
                 assert "*Project:* *Priority:* High \\| *Team:* Core Infra" in kwargs["description"]
 
 
+@patch("quill.sync.JiraClient")
+@patch("quill.sync.GitHubClient")
 class TestMergeJiraLabels:
-    def test_merge_labels_with_entity_property(self, v2_config):
+    def test_merge_labels_with_entity_property(self, mock_gh_cls, mock_jira_cls, v2_config):
         engine = SyncEngine(v2_config)
         mock_jira_issue = MagicMock()
         mock_jira_issue.fields.labels = ["github-synced", "proj-status-in-progress", "bug", "need-qa", "jira-custom"]
@@ -172,7 +180,7 @@ class TestMergeJiraLabels:
         merged = engine._merge_jira_labels(mock_jira_issue, "CAS-1", all_labels)
         assert merged == ["github-synced", "jira-custom", "need-qa", "proj-status-done"]
 
-    def test_merge_labels_fallback_without_entity_property(self, v2_config):
+    def test_merge_labels_fallback_without_entity_property(self, mock_gh_cls, mock_jira_cls, v2_config):
         engine = SyncEngine(v2_config)
         mock_jira_issue = MagicMock()
         mock_jira_issue.fields.labels = ["github-synced", "proj-status-in-progress", "bug", "need-qa"]
@@ -185,27 +193,29 @@ class TestMergeJiraLabels:
         assert merged == ["bug", "github-synced", "need-qa", "proj-status-done"]
 
 
+@patch("quill.sync.JiraClient")
+@patch("quill.sync.GitHubClient")
 class TestSyncParentRelationships:
-    def test_resolve_parent_jira_key_direct_key(self, v2_config):
+    def test_resolve_parent_jira_key_direct_key(self, mock_gh_cls, mock_jira_cls, v2_config):
         engine = SyncEngine(v2_config)
         resolved = engine._resolve_parent_jira_key("CAS-100", {}, "CAS")
         assert resolved == "CAS-100"
 
-    def test_resolve_parent_jira_key_via_lookup(self, v2_config):
+    def test_resolve_parent_jira_key_via_lookup(self, mock_gh_cls, mock_jira_cls, v2_config):
         engine = SyncEngine(v2_config)
         mock_parent_issue = MagicMock()
         mock_parent_issue.key = "CAS-12"
-        lookup = {"https://github.com/test-owner/test-repo/issues/12": mock_parent_issue}
+        lookup = {"https://github.com/your-org/your-repo/issues/12": mock_parent_issue}
 
         resolved = engine._resolve_parent_jira_key("#12", lookup, "CAS")
         assert resolved == "CAS-12"
 
-    def test_sync_parent_relationships(self, v2_config):
+    def test_sync_parent_relationships(self, mock_gh_cls, mock_jira_cls, v2_config):
         engine = SyncEngine(v2_config)
         mock_parent_issue = MagicMock()
         mock_parent_issue.key = "CAS-12"
-        lookup = {"https://github.com/test-owner/test-repo/issues/12": mock_parent_issue}
-        pending = {"https://github.com/test-owner/test-repo/issues/42": ("CAS-42", "#12")}
+        lookup = {"https://github.com/your-org/your-repo/issues/12": mock_parent_issue}
+        pending = {"https://github.com/your-org/your-repo/issues/42": ("CAS-42", "#12", False)}
 
         with patch.object(engine.jira_client, "set_parent_issue") as mock_set_parent:
             engine._sync_parent_relationships(v2_config.repos[0], pending, lookup, dry_run=False)
@@ -213,4 +223,35 @@ class TestSyncParentRelationships:
                 issue_key="CAS-42",
                 parent_key="CAS-12",
                 epic_link_field="customfield_10014",
+                promote_to_epic=False,
             )
+
+
+class TestHierarchyClassification:
+    def test_epic_container_hierarchy_classification(self):
+        """Test that parent container issue #39 (even if linked to parent) is classified as Level 1 Epic, and all children (#120-#123) are Level 2 Tasks without splitting."""
+        import types
+        issues = [
+            types.SimpleNamespace(number=39, labels=[]),
+            types.SimpleNamespace(number=120, labels=[]),
+            types.SimpleNamespace(number=121, labels=[]),
+            types.SimpleNamespace(number=122, labels=[]),
+            types.SimpleNamespace(number=123, labels=[]),
+            types.SimpleNamespace(number=200, labels=[]),
+        ]
+        repo_parents = {
+            39: "10",  # #39 is linked to some higher goal #10
+            120: "39", # #120 has child #200
+            121: "39",
+            122: "39",
+            123: "39",
+            200: "120",
+        }
+
+        level1_epics, level2_tasks, level3_subtasks = SyncEngine._classify_hierarchy_levels(
+            gh_issues=issues,
+            repo_parents=repo_parents,
+        )
+        assert 39 in level1_epics
+        assert {120, 121, 122, 123}.issubset(level2_tasks)
+        assert 200 in level3_subtasks
