@@ -165,36 +165,29 @@ class SyncEngine:
         else:
             existing_lookup = {}
 
-        # Step 1.5 — zero-cost description hash check + batch pre-fetch fallback
+        # Step 1.5 — zero-cost description hash check (memory only, no HTTP calls)
         if not dry_run and existing_lookup:
-            unresolved_keys = []
             for iss in existing_lookup.values():
-                if getattr(iss, "_quill_cached_hash", None) is not None:
-                    continue
-                loaded_hash = self.jira_client.get_issue_property_from_issue(
-                    iss, "quill-content-hash"
-                )
-                if loaded_hash:
-                    setattr(iss, "_quill_cached_hash", loaded_hash)
-                    continue
-                desc = getattr(getattr(iss, "fields", None), "description", "") or ""
-                footer_hash = extract_hash_footer(desc)
-                if footer_hash:
-                    setattr(iss, "_quill_cached_hash", footer_hash)
-                else:
-                    unresolved_keys.append(iss.key)
-
-            if unresolved_keys:
-                logger.debug(
-                    f"Description hash missed for {len(unresolved_keys)} issues; "
-                    f"batch fetching properties…"
-                )
-                cached_hashes = self.jira_client.batch_get_issue_properties(
-                    unresolved_keys, "quill-content-hash"
-                )
-                for iss in existing_lookup.values():
-                    if iss.key in cached_hashes:
-                        setattr(iss, "_quill_cached_hash", cached_hashes[iss.key])
+                if getattr(iss, "_quill_cached_hash", None) is None:
+                    loaded_hash = self.jira_client.get_issue_property_from_issue(
+                        iss, "quill-content-hash"
+                    )
+                    if loaded_hash:
+                        setattr(iss, "_quill_cached_hash", loaded_hash)
+                    else:
+                        desc = getattr(getattr(iss, "fields", None), "description", "") or ""
+                        footer_hash = extract_hash_footer(desc)
+                        if footer_hash:
+                            setattr(iss, "_quill_cached_hash", footer_hash)
+                if getattr(iss, "_quill_cached_comments_count", None) is None:
+                    loaded_cnt = self.jira_client.get_issue_property_from_issue(
+                        iss, "quill-synced-comments-count"
+                    )
+                    if loaded_cnt is not None:
+                        try:
+                            setattr(iss, "_quill_cached_comments_count", int(loaded_cnt))
+                        except Exception:
+                            pass
 
         # Step 1.8 & Step 2 — fetch or use pre-fetched GitHub issues and custom fields
         if pre_fetched_gh_data is not None:
@@ -220,6 +213,43 @@ class SyncEngine:
                 state=rc.issue_filter.state,
                 labels=rc.issue_filter.labels or None,
             )
+
+        # Step 2.5 — targeted high-speed parallel property pre-fetch for matching repo issues ONLY
+        if not dry_run and existing_lookup and gh_issues:
+            keys_for_hash = set()
+            keys_for_comments = set()
+            for issue in gh_issues:
+                gh_url = getattr(issue, "html_url", "")
+                iss = existing_lookup.get(gh_url)
+                if not iss:
+                    summary_prefix = f"[{rc.repo}#{issue.number}]"
+                    for candidate in existing_lookup.values():
+                        if getattr(getattr(candidate, "fields", None), "summary", "").startswith(summary_prefix):
+                            iss = candidate
+                            break
+                if iss:
+                    setattr(iss, "_quill_cached_hash_checked", True)
+                    if getattr(iss, "_quill_cached_hash", None) is None:
+                        keys_for_hash.add(iss.key)
+                    if getattr(iss, "_quill_cached_comments_count", None) is None and getattr(issue, "comments", 0) > 0:
+                        keys_for_comments.add(iss.key)
+
+            max_workers = self._get_max_workers(max(len(keys_for_hash), len(keys_for_comments), 1))
+            if keys_for_hash:
+                logger.debug(f"Batch fetching hash properties for {len(keys_for_hash)} repo issues…")
+                cached_hashes = self.jira_client.batch_get_issue_properties(list(keys_for_hash), "quill-content-hash", max_workers=max_workers)
+                for iss in existing_lookup.values():
+                    if iss.key in cached_hashes:
+                        setattr(iss, "_quill_cached_hash", cached_hashes[iss.key])
+            if keys_for_comments:
+                logger.debug(f"Batch fetching comments-count properties for {len(keys_for_comments)} repo issues…")
+                cached_comments = self.jira_client.batch_get_issue_properties(list(keys_for_comments), "quill-synced-comments-count", max_workers=max_workers)
+                for iss in existing_lookup.values():
+                    if iss.key in cached_comments and cached_comments[iss.key] is not None:
+                        try:
+                            setattr(iss, "_quill_cached_comments_count", int(cached_comments[iss.key]))
+                        except Exception:
+                            pass
 
         stats = {
             "created": 0,
@@ -913,6 +943,8 @@ class SyncEngine:
                 self.jira_client.set_issue_property(
                     jira_key, "quill-synced-comments-count", str(getattr(issue, "comments", 0))
                 )
+                if jira_issue is not None:
+                    setattr(jira_issue, "_quill_cached_comments_count", int(getattr(issue, "comments", 0)))
             except Exception:
                 pass
 

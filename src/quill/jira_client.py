@@ -1,3 +1,4 @@
+import os
 import warnings
 import requests
 import concurrent.futures
@@ -765,14 +766,16 @@ class JiraClient:
         except Exception as exc:
             logger.debug(f"set_issue_property failed for {issue_key}: {exc}")
 
-    def batch_get_issue_properties(self, issue_keys: list[str], property_key: str) -> dict[str, Any]:
-        """Fetch an entity property for multiple issues in parallel using a polite read-only thread pool."""
+    def batch_get_issue_properties(self, issue_keys: list[str], property_key: str, max_workers: Optional[int] = None) -> dict[str, Any]:
+        """Fetch an entity property for multiple issues in parallel using a high-throughput thread pool."""
         if not issue_keys:
             return {}
         results: dict[str, Any] = {}
-        # GitHub standard runners (ubuntu-latest) have 2 vCPUs. Using max_workers=4 is gentle on
-        # network firewalls while still providing a 4x I/O speedup over serial requests.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(issue_keys))) as executor:
+        if max_workers is None:
+            max_workers = min(32, max(4, (os.cpu_count() or 4) * 4), len(issue_keys))
+        else:
+            max_workers = min(max_workers, len(issue_keys))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_key = {
                 executor.submit(self.get_issue_property, key, property_key): key
                 for key in issue_keys
