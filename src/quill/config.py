@@ -138,6 +138,7 @@ class Settings(BaseSettings):
     # ── Sync ───────────────────────────────────────────────────────────
     dry_run: bool = False
     batch_size: int = 50
+    sync_concurrency: int = 4
 
 
 # Module-level singleton — importable as ``from quill.config import settings``

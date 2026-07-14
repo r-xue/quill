@@ -1,9 +1,55 @@
 import json
+import types
 import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Optional
 from github import Github
 from quill.log import logger
+
+
+class GHIssueProxy:
+    """Lightweight, zero-HTTP issue representation populated directly via GraphQL bulk query."""
+    def __init__(self, node: dict[str, Any]):
+        self.number = int(node["number"])
+        self.title = node.get("title", "") or ""
+        self.body = node.get("body", "") or ""
+        self.state = node.get("state", "").lower()
+        self.html_url = node.get("url", "")
+        
+        author_data = node.get("author") or {}
+        self.user = types.SimpleNamespace(
+            login=author_data.get("login", "unknown"),
+            html_url=author_data.get("url", ""),
+        )
+        
+        comments_data = node.get("comments") or {}
+        self.comments = int(comments_data.get("totalCount", 0))
+        
+        labels_data = node.get("labels") or {}
+        label_nodes = labels_data.get("nodes") or []
+        self.labels = [types.SimpleNamespace(name=lbl.get("name", "")) for lbl in label_nodes if lbl.get("name")]
+        
+        created_str = node.get("createdAt", "")
+        if created_str:
+            try:
+                self.created_at = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+            except Exception:
+                self.created_at = datetime.now(timezone.utc)
+        else:
+            self.created_at = datetime.now(timezone.utc)
+            
+        updated_str = node.get("updatedAt", "")
+        if updated_str:
+            try:
+                self.updated_at = datetime.fromisoformat(updated_str.replace("Z", "+00:00"))
+            except Exception:
+                self.updated_at = self.created_at
+        else:
+            self.updated_at = self.created_at
+
+    @property
+    def pull_request(self):
+        return None
 
 
 class GitHubClient:
@@ -38,6 +84,92 @@ class GitHubClient:
         """
         full_name = f"{owner}/{repo_name}"
         logger.info(f"Fetching issues from GitHub repository: {full_name}")
+        if since:
+            logger.info(f"Incremental sync: fetching issues updated since {since}")
+
+        if self.token:
+            try:
+                query = """
+                query($owner: String!, $name: String!, $cursor: String, $states: [IssueState!], $since: DateTime) {
+                  repository(owner: $owner, name: $name) {
+                    issues(first: 100, after: $cursor, filterBy: {states: $states, since: $since}) {
+                      pageInfo {
+                        hasNextPage
+                        endCursor
+                      }
+                      nodes {
+                        number
+                        title
+                        body
+                        state
+                        url
+                        createdAt
+                        updatedAt
+                        author { login url }
+                        comments { totalCount }
+                        labels(first: 50) {
+                          nodes { name }
+                        }
+                      }
+                    }
+                  }
+                }
+                """
+                states_arg = []
+                if state == "open":
+                    states_arg = ["OPEN"]
+                elif state == "closed":
+                    states_arg = ["CLOSED"]
+                elif state == "all":
+                    states_arg = ["OPEN", "CLOSED"]
+
+                since_arg = None
+                if since:
+                    cleaned_since = since.replace("Z", "+00:00")
+                    dt_with_tz = datetime.fromisoformat(cleaned_since)
+                    if dt_with_tz.tzinfo is None:
+                        dt_with_tz = dt_with_tz.replace(tzinfo=timezone.utc)
+                    since_arg = dt_with_tz.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+                cursor = None
+                has_next_page = True
+                filtered_issues = []
+
+                while has_next_page:
+                    variables: dict[str, Any] = {
+                        "owner": owner,
+                        "name": repo_name,
+                        "cursor": cursor,
+                    }
+                    if states_arg:
+                        variables["states"] = states_arg
+                    if since_arg:
+                        variables["since"] = since_arg
+
+                    data = self._execute_graphql(query, variables)
+                    if not data or "repository" not in data or not data["repository"]:
+                        break
+                    issues_data = data["repository"].get("issues", {})
+                    nodes = issues_data.get("nodes", [])
+                    for node in nodes:
+                        if not node or "number" not in node:
+                            continue
+                        proxy = GHIssueProxy(node)
+                        if labels:
+                            issue_labels = [label.name for label in proxy.labels]
+                            if not any(label in issue_labels for label in labels):
+                                continue
+                        filtered_issues.append(proxy)
+
+                    page_info = issues_data.get("pageInfo", {})
+                    has_next_page = page_info.get("hasNextPage", False)
+                    cursor = page_info.get("endCursor")
+
+                logger.info(f"Found {len(filtered_issues)} issues to process in {full_name}")
+                return filtered_issues
+            except Exception as exc:
+                logger.debug(f"GraphQL issue fetch failed ({exc}); falling back to PyGithub REST API…")
+
         repo = self.gh.get_repo(full_name)
 
         kwargs: dict[str, Any] = {"state": state}
@@ -48,7 +180,6 @@ class GitHubClient:
                 dt_with_tz = dt_with_tz.replace(tzinfo=timezone.utc)
             dt_utc = dt_with_tz.astimezone(timezone.utc).replace(tzinfo=None)
             kwargs["since"] = dt_utc
-            logger.info(f"Incremental sync: fetching issues updated since {since}")
 
         issues = repo.get_issues(**kwargs)
         filtered_issues = []
