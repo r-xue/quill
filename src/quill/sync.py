@@ -258,7 +258,7 @@ class SyncEngine:
             "comments": 0,
             "errors": 0,
         }
-        level1_epics, level2_tasks, level3_subtasks = self._classify_hierarchy_levels(gh_issues, repo_parents)
+        level1_epics, level2_tasks, level3_subtasks = self._classify_hierarchy_levels(gh_issues, repo_parents, current_repo_full_name=rc.full_name)
         def _tier_sort_key(iss: Any) -> int:
             if iss.number in level1_epics:
                 return 1
@@ -313,6 +313,7 @@ class SyncEngine:
     def _classify_hierarchy_levels(
         gh_issues: list[Any],
         repo_parents: Optional[dict[int, str]],
+        current_repo_full_name: Optional[str] = None,
     ) -> tuple[set[int], set[int], set[int]]:
         """Classify issues in a repo into Level 1 (Epics), Level 2 (Tasks), and Level 3 (Sub-tasks)."""
         level1_epics: set[int] = set()
@@ -325,6 +326,13 @@ class SyncEngine:
         child_numbers = set(repo_parents.keys())
         parent_numbers: set[int] = set()
         for child_num, pref in repo_parents.items():
+            if not pref:
+                continue
+            if current_repo_full_name and "/" in pref:
+                # If pref contains a slash (e.g. cross-repo URL like https://github.com/casangi/RADPS-roadmap/issues/118),
+                # ensure it points to the current repository before adding its ID to parent_numbers.
+                if f"/{current_repo_full_name}/" not in pref and not pref.startswith(f"{current_repo_full_name}/"):
+                    continue
             clean_num = re.sub(r"[^0-9]", "", pref.split("/")[-1] if "/" in pref else pref)
             if clean_num and clean_num.isdigit():
                 parent_numbers.add(int(clean_num))
@@ -483,15 +491,16 @@ class SyncEngine:
                     break
 
         parent_jira_key_for_create = None
-        if level3_subtasks and issue.number in level3_subtasks:
-            parent_ref_for_subtask = None
-            if repo_parents and issue.number in repo_parents:
-                parent_ref_for_subtask = repo_parents[issue.number]
-            if parent_ref_for_subtask:
-                p_key = self._resolve_parent_jira_key(parent_ref_for_subtask, lookup, rc.jira_project)
+        parent_jira_key_for_migration = None
+        if repo_parents and issue.number in repo_parents:
+            pref = repo_parents[issue.number]
+            if pref:
+                p_key = self._resolve_parent_jira_key(pref, lookup, rc.jira_project)
                 if p_key:
-                    target_issue_type = self.jira_client.discover_subtask_issue_type()
-                    parent_jira_key_for_create = p_key
+                    if level3_subtasks and issue.number in level3_subtasks:
+                        target_issue_type = self.jira_client.discover_subtask_issue_type()
+                        parent_jira_key_for_create = p_key
+                    parent_jira_key_for_migration = p_key
 
         if jira_issue is None:
             # ── NEW ──────────────────────────────────────────────────
@@ -555,7 +564,7 @@ class SyncEngine:
                 is_target_subtask = "sub-task" in target_issue_type.lower() or "subtask" in target_issue_type.lower()
                 if not (is_target_subtask and not parent_jira_key_for_create):
                     if not dry_run:
-                        res_type = self.jira_client.update_issue_type(jira_key, target_issue_type, parent_key=parent_jira_key_for_create)
+                        res_type = self.jira_client.update_issue_type(jira_key, target_issue_type, parent_key=parent_jira_key_for_migration or parent_jira_key_for_create)
                         if isinstance(res_type, str):
                             jira_key = res_type
                             try:
@@ -571,6 +580,9 @@ class SyncEngine:
                                     lookup[gh_url] = types.SimpleNamespace(key=jira_key)
                     else:
                         logger.info(f"[Dry Run] Would migrate {jira_key} issue type from '{curr_issue_type}' to '{target_issue_type}'")
+
+            if ((target_issue_type and target_issue_type.lower() == "epic") or (curr_issue_type and curr_issue_type.lower() == "epic")) and not dry_run:
+                self.jira_client.set_epic_name(jira_key, summary)
 
             # Primary: read hash from pre-fetched cache or issue property (zero HTTP cost)
             existing_hash = getattr(jira_issue, "_quill_cached_hash", None)
@@ -863,18 +875,6 @@ class SyncEngine:
                 logger.info(
                     f"[Dry Run] Would link {child_jira_key} to parent/epic {parent_jira_key} (promote={promote_to_epic})"
                 )
-
-            if not promote_to_epic and parent_jira_key:
-                subtask_type = self.jira_client.discover_subtask_issue_type()
-                if not dry_run:
-                    res_type = self.jira_client.update_issue_type(child_jira_key, subtask_type, parent_key=parent_jira_key)
-                    if isinstance(res_type, str):
-                        import types
-                        child_jira_key = res_type
-                        if lookup is not None:
-                            lookup[child_gh_url] = types.SimpleNamespace(key=child_jira_key)
-                else:
-                    logger.info(f"[Dry Run] Would migrate {child_jira_key} issue type to sub-task '{subtask_type}' with parent {parent_jira_key}")
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=self._get_max_workers(len(pending_parent_links))) as executor:
             list(executor.map(_process_parent_link, pending_parent_links.items()))

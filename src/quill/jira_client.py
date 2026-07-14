@@ -6,6 +6,10 @@ from typing import Optional, Any, Union
 from jira import JIRA
 from quill.log import logger
 
+# Suppress the non-actionable "Unable to gather applicationlinks" warning
+# that python-jira emits when the user lacks Jira admin permission.
+warnings.filterwarnings("ignore", message=".*applicationlinks.*")
+
 
 class JiraClient:
     def __init__(self, server: str, token: str, verify_ssl: bool = True):
@@ -482,15 +486,30 @@ class JiraClient:
                     f"Note: {issue_key} is linked to parent {parent_key} via 'parent' field/hierarchy, "
                     f"but Jira Server REST API prohibits converting top-level Task into a Sub-task ({err_msg})."
                 )
+            elif curr_type.lower() in ("sub-task", "subtask") and not is_target_subtask:
+                # Jira Server REST API also forbids in-place conversion from Sub-task -> top-level Task across tiers.
+                # Re-create as standard top-level issue under parent (e.g. linked to Epic via Epic Link) and delete old sub-task!
+                new_key = self.recreate_as_standard_issue(
+                    old_issue_key=issue_key,
+                    new_type=new_type,
+                    parent_key=parent_key,
+                    github_link_field=getattr(self, "_last_github_link_field", None),
+                )
+                if new_key:
+                    return new_key
+                logger.debug(
+                    f"Note: {issue_key} is currently a Sub-task under {parent_key}, "
+                    f"but Jira Server REST API prohibits converting Sub-task into top-level '{new_type}' ({err_msg})."
+                )
             else:
                 logger.warning(f"Could not migrate issue type for {issue_key} to '{new_type}': {err_msg}")
             return False
 
-    def delete_issue(self, issue_key: str) -> bool:
-        """Permanently delete an existing Jira issue."""
+    def delete_issue(self, issue_key: str, delete_subtasks: bool = True) -> bool:
+        """Permanently delete an existing Jira issue along with its sub-tasks."""
         try:
             issue = self.jira.issue(issue_key)
-            issue.delete()
+            issue.delete(deleteSubtasks=delete_subtasks)
             logger.info(f"Deleted stale/legacy Jira issue {issue_key}")
             return True
         except Exception as exc:
@@ -521,6 +540,7 @@ class JiraClient:
             gh_url = self.get_issue_property_from_issue(old_issue, "quill-github-url")
             content_hash = self.get_issue_property_from_issue(old_issue, "quill-content-hash")
             synced_labels = self.get_issue_property_from_issue(old_issue, "quill-synced-labels")
+            comments_cnt = self.get_issue_property_from_issue(old_issue, "quill-synced-comments-count")
 
             new_key = self.create_issue(
                 project=project,
@@ -550,10 +570,15 @@ class JiraClient:
                 self.set_issue_property(new_key, "quill-github-url", gh_url)
             if synced_labels:
                 self.set_issue_property(new_key, "quill-synced-labels", synced_labels)
+            if comments_cnt:
+                self.set_issue_property(new_key, "quill-synced-comments-count", comments_cnt)
+
+            # Copy over Jira-side workflow metadata before deleting old issue
+            self._copy_jira_metadata(old_issue, new_key)
 
             # Delete the stale ticket rather than archiving
             try:
-                old_issue.delete()
+                old_issue.delete(deleteSubtasks=True)
                 logger.info(f"Successfully re-created {old_issue_key} -> {new_key} and deleted stale top-level ticket.")
             except Exception as exc_del:
                 logger.warning(f"Re-created {new_key}, but could not delete stale ticket {old_issue_key}: {exc_del}")
@@ -563,6 +588,191 @@ class JiraClient:
             err_msg = getattr(exc, "text", str(exc)).split("\n")[0]
             logger.warning(f"Could not re-create {old_issue_key} as sub-task: {err_msg}")
             return None
+
+    def recreate_as_standard_issue(
+        self,
+        old_issue_key: str,
+        new_type: str,
+        parent_key: Optional[str] = None,
+        github_link_field: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Re-create an existing Sub-task as a top-level standard issue (e.g. Task) under parent_key and delete the stale old sub-task.
+        """
+        try:
+            old_issue = self.jira.issue(old_issue_key)
+            if not parent_key:
+                parent_key = getattr(getattr(old_issue.fields, "parent", None), "key", None)
+
+            logger.info(f"Re-creating {old_issue_key} as top-level '{new_type}' under parent {parent_key} and deleting stale Sub-task…")
+            summary = getattr(old_issue.fields, "summary", str(old_issue_key))
+            description = getattr(old_issue.fields, "description", "")
+            project = getattr(getattr(old_issue.fields, "project", None), "key", "GITHUB")
+            labels = getattr(old_issue.fields, "labels", [])
+            due_date = getattr(old_issue.fields, "duedate", None)
+
+            # Retrieve properties before deleting
+            gh_url = self.get_issue_property_from_issue(old_issue, "quill-github-url")
+            content_hash = self.get_issue_property_from_issue(old_issue, "quill-content-hash")
+            synced_labels = self.get_issue_property_from_issue(old_issue, "quill-synced-labels")
+            comments_cnt = self.get_issue_property_from_issue(old_issue, "quill-synced-comments-count")
+
+            new_key = self.create_issue(
+                project=project,
+                summary=summary,
+                description=description,
+                issue_type=new_type,
+                labels=labels,
+                github_link_field=github_link_field,
+                github_url=gh_url,
+                due_date=due_date,
+                parent_key=None,
+            )
+
+            if parent_key:
+                try:
+                    self.set_parent_issue(
+                        issue_key=new_key,
+                        parent_key=parent_key,
+                        epic_link_field=getattr(self, "_last_epic_link_field", "customfield_10014"),
+                        promote_to_epic=True,
+                    )
+                except Exception as exc_p:
+                    logger.debug(f"Could not link re-created {new_key} to parent {parent_key}: {exc_p}")
+
+            if gh_url:
+                try:
+                    self.add_remote_link(
+                        issue_key=new_key,
+                        github_url=gh_url,
+                        title=f"GitHub #{gh_url.rstrip('/').split('/')[-1]}",
+                    )
+                except Exception as exc_rl:
+                    logger.debug(f"Could not add remote link on re-created {new_key}: {exc_rl}")
+
+            if content_hash:
+                self.set_issue_property(new_key, "quill-content-hash", content_hash)
+            if gh_url:
+                self.set_issue_property(new_key, "quill-github-url", gh_url)
+            if synced_labels:
+                self.set_issue_property(new_key, "quill-synced-labels", synced_labels)
+            if comments_cnt:
+                self.set_issue_property(new_key, "quill-synced-comments-count", comments_cnt)
+
+            # Copy over Jira-side workflow metadata before deleting old sub-task
+            self._copy_jira_metadata(old_issue, new_key)
+
+            # Delete the stale sub-task
+            try:
+                old_issue.delete(deleteSubtasks=True)
+                logger.info(f"Successfully re-created {old_issue_key} -> {new_key} and deleted stale sub-task.")
+            except Exception as exc_del:
+                logger.warning(f"Re-created {new_key}, but could not delete stale sub-task {old_issue_key}: {exc_del}")
+
+            return new_key
+        except Exception as exc:
+            err_msg = getattr(exc, "text", str(exc)).split("\n")[0]
+            logger.warning(f"Could not re-create {old_issue_key} as standard issue '{new_type}': {err_msg}")
+            return None
+
+    def _copy_jira_metadata(self, old_issue: Any, new_issue_key: str):
+        """
+        Copy editable Jira-side metadata (Sprint, Assignee, Priority, Components, Versions, Story Points, Team, etc.)
+        from an old issue to a re-created issue during tier migration.
+        """
+        logger.info(f"Copying Jira workflow metadata (Sprint, Assignee, Priority, etc.) from {old_issue.key} to {new_issue_key}…")
+        try:
+            new_issue = self.jira.issue(new_issue_key)
+            new_type = getattr(getattr(new_issue.fields, "issuetype", None), "name", "").lower()
+            is_new_subtask = "sub-task" in new_type or "subtask" in new_type
+            fields_to_update: dict[str, Any] = {}
+
+            # 1. Assignee
+            assignee = getattr(old_issue.fields, "assignee", None)
+            if assignee:
+                if getattr(assignee, "name", None):
+                    fields_to_update["assignee"] = {"name": assignee.name}
+                elif getattr(assignee, "accountId", None):
+                    fields_to_update["assignee"] = {"accountId": assignee.accountId}
+
+            # 2. Priority
+            priority = getattr(old_issue.fields, "priority", None)
+            if priority:
+                if getattr(priority, "id", None):
+                    fields_to_update["priority"] = {"id": str(priority.id)}
+                elif getattr(priority, "name", None):
+                    fields_to_update["priority"] = {"name": priority.name}
+
+            # 3. Components
+            components = getattr(old_issue.fields, "components", None)
+            if components:
+                comps = []
+                for c in components:
+                    if getattr(c, "id", None):
+                        comps.append({"id": str(c.id)})
+                    elif getattr(c, "name", None):
+                        comps.append({"name": c.name})
+                if comps:
+                    fields_to_update["components"] = comps
+
+            # 4. Fix Versions and Affects Versions
+            for v_field in ("fixVersions", "versions"):
+                v_list = getattr(old_issue.fields, v_field, None) or []
+                v_dicts = []
+                for v in v_list:
+                    if getattr(v, "id", None):
+                        v_dicts.append({"id": str(v.id)})
+                    elif getattr(v, "name", None):
+                        v_dicts.append({"name": v.name})
+                if v_dicts:
+                    fields_to_update[v_field] = v_dicts
+
+            # 5. Sprint (only if new issue is NOT a sub-task, as sub-tasks inherit sprint from parent)
+            if not is_new_subtask:
+                sprint_val = getattr(old_issue.raw.get("fields", {}), "customfield_10001", None)
+                # If old issue was a sub-task when it had sprint inherited, check parent:
+                if not sprint_val and getattr(old_issue.fields, "parent", None):
+                    try:
+                        p_key = old_issue.fields.parent.key
+                        p_iss = self.jira.issue(p_key)
+                        sprint_val = getattr(p_iss.raw.get("fields", {}), "customfield_10001", None)
+                    except Exception:
+                        pass
+                if sprint_val:
+                    import re
+                    s_items = sprint_val if isinstance(sprint_val, list) else [sprint_val]
+                    for item in s_items:
+                        if isinstance(item, int):
+                            fields_to_update["customfield_10001"] = item
+                            break
+                        elif isinstance(item, str):
+                            if item.isdigit():
+                                fields_to_update["customfield_10001"] = int(item)
+                                break
+                            m = re.search(r"\bid=(\d+)\b", item)
+                            if m:
+                                fields_to_update["customfield_10001"] = int(m.group(1))
+                                break
+
+            # 6. Story Points and other numeric/string custom fields
+            for cf_key in ("customfield_10006", "customfield_11200", "customfield_11600", "customfield_11604"):
+                cf_val = old_issue.raw.get("fields", {}).get(cf_key)
+                if cf_val is not None and cf_val != "" and cf_val != []:
+                    fields_to_update[cf_key] = cf_val
+
+            if fields_to_update:
+                try:
+                    new_issue.update(fields=fields_to_update)
+                    logger.info(f"Successfully copied Jira metadata to {new_issue_key}: {list(fields_to_update.keys())}")
+                except Exception as exc_up:
+                    logger.debug(f"Batch metadata copy failed ({exc_up}); trying fields individually…")
+                    for k, v in fields_to_update.items():
+                        try:
+                            new_issue.update(fields={k: v})
+                        except Exception as exc_single:
+                            logger.debug(f"Could not copy field {k} ({v}) to {new_issue_key}: {exc_single}")
+        except Exception as exc_main:
+            logger.debug(f"Could not copy Jira metadata from {old_issue.key} to {new_issue_key}: {exc_main}")
 
     def update_issue(
         self,
