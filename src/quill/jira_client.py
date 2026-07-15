@@ -353,6 +353,11 @@ class JiraClient:
         if parent_key and is_subtask_type:
             issue_dict["parent"] = {"key": parent_key}
 
+        if issue_type.lower() == "epic":
+            epic_name_field = self.discover_epic_name_field_id()
+            if epic_name_field:
+                issue_dict[epic_name_field] = summary[:250]
+
         logger.info(f"Creating Jira issue in project {project} (type: {issue_type})…")
         try:
             new_issue = self.jira.create_issue(fields=issue_dict)
@@ -366,7 +371,7 @@ class JiraClient:
                 raise
         key = new_issue.key
 
-        if issue_type.lower() == "epic":
+        if issue_type.lower() == "epic" and not self.discover_epic_name_field_id():
             self.set_epic_name(key, summary)
 
         # Set the custom field via edit (bypasses create-screen restrictions)
@@ -447,9 +452,25 @@ class JiraClient:
                 except Exception:
                     fields_to_update["parent"] = {"key": parent_key}
 
+            epic_name_field = None
+            if new_type.lower() == "epic":
+                summary = getattr(issue.fields, "summary", str(issue_key))
+                epic_name_field = self.discover_epic_name_field_id()
+                if epic_name_field:
+                    fields_to_update[epic_name_field] = summary[:250]
+
             try:
-                issue.update(fields=fields_to_update)
-                if new_type.lower() == "epic":
+                try:
+                    issue.update(fields=fields_to_update)
+                except Exception as exc_screen:
+                    if epic_name_field and epic_name_field in fields_to_update:
+                        fields_no_epic = {k: v for k, v in fields_to_update.items() if k != epic_name_field}
+                        issue.update(fields=fields_no_epic)
+                        summary = getattr(issue.fields, "summary", str(issue_key))
+                        self.set_epic_name(issue_key, summary)
+                    else:
+                        raise exc_screen
+                if new_type.lower() == "epic" and not epic_name_field:
                     summary = getattr(issue.fields, "summary", str(issue_key))
                     self.set_epic_name(issue_key, summary)
                 return True
@@ -459,11 +480,22 @@ class JiraClient:
                         # Try legacy server fields (`parentIssueKey` / `parentIssueId`)
                         p_id = fields_to_update.get("parent", {}).get("id")
                         alt_fields = {"issuetype": {"id": str(new_type_obj.id)}}
+                        if epic_name_field:
+                            alt_fields[epic_name_field] = summary[:250]
                         if p_id:
                             alt_fields["parentIssueId"] = p_id
                         else:
                             alt_fields["parentIssueKey"] = parent_key
-                        issue.update(fields=alt_fields)
+                        try:
+                            issue.update(fields=alt_fields)
+                        except Exception as exc_alt_screen:
+                            if epic_name_field and epic_name_field in alt_fields:
+                                alt_no_epic = {k: v for k, v in alt_fields.items() if k != epic_name_field}
+                                issue.update(fields=alt_no_epic)
+                                summary = getattr(issue.fields, "summary", str(issue_key))
+                                self.set_epic_name(issue_key, summary)
+                            else:
+                                raise exc_alt_screen
                         return True
                     except Exception:
                         pass
@@ -486,9 +518,9 @@ class JiraClient:
                     f"Note: {issue_key} is linked to parent {parent_key} via 'parent' field/hierarchy, "
                     f"but Jira Server REST API prohibits converting top-level Task into a Sub-task ({err_msg})."
                 )
-            elif curr_type.lower() in ("sub-task", "subtask") and not is_target_subtask:
-                # Jira Server REST API also forbids in-place conversion from Sub-task -> top-level Task across tiers.
-                # Re-create as standard top-level issue under parent (e.g. linked to Epic via Epic Link) and delete old sub-task!
+            elif not is_target_subtask:
+                # If in-place issue.update of issuetype failed across tiers or between top-level types (e.g., Task -> Epic or Sub-task -> Task/Epic),
+                # re-create as standard top-level issue of new_type and delete old stale ticket!
                 new_key = self.recreate_as_standard_issue(
                     old_issue_key=issue_key,
                     new_type=new_type,
@@ -498,8 +530,7 @@ class JiraClient:
                 if new_key:
                     return new_key
                 logger.debug(
-                    f"Note: {issue_key} is currently a Sub-task under {parent_key}, "
-                    f"but Jira Server REST API prohibits converting Sub-task into top-level '{new_type}' ({err_msg})."
+                    f"Note: {issue_key} could not be converted in-place or re-created as '{new_type}' ({err_msg})."
                 )
             else:
                 logger.warning(f"Could not migrate issue type for {issue_key} to '{new_type}': {err_msg}")
@@ -847,13 +878,15 @@ class JiraClient:
                 is_parent_epic = True
                 # Ensure its Epic Name custom field is populated cleanly
                 self.set_epic_name(parent_key, parent_summary)
-            elif promote_to_epic:
+            elif promote_to_epic and parent_type.lower() not in ("sub-task", "subtask") and getattr(parent_issue.fields, "parent", None) is None:
                 logger.info(f"Parent issue {parent_key} currently has issue type '{parent_type}' (not 'Epic'). Promoting to 'Epic' so Epic Link / Agile hierarchy works…")
                 try:
-                    parent_issue.update(fields={"issuetype": {"name": "Epic"}})
-                    logger.info(f"Successfully promoted {parent_key} to issue type 'Epic'.")
-                    self.set_epic_name(parent_key, parent_summary)
-                    is_parent_epic = True
+                    res_promo = self.update_issue_type(parent_key, "Epic")
+                    if res_promo:
+                        logger.info(f"Successfully promoted {parent_key} to issue type 'Epic'.")
+                        is_parent_epic = True
+                        if isinstance(res_promo, str):
+                            parent_key = res_promo
                 except Exception as exc_up:
                     logger.debug(f"Could not automatically promote {parent_key} to 'Epic' ({exc_up}). Epic Link attempts may fail if parent must be an Epic.")
             else:
@@ -959,7 +992,7 @@ class JiraClient:
         """
         Store a JSON value as an issue entity property.
         Silently ignored on failure (property is non-critical metadata).
-        """
+        """ 
         url = f"{self.server}/rest/api/2/issue/{issue_key}/properties/{property_key}"
         try:
             resp = requests.put(

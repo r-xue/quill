@@ -255,3 +255,174 @@ class TestHierarchyClassification:
         assert 39 in level1_epics
         assert {120, 121, 122, 123}.issubset(level2_tasks)
         assert 200 in level3_subtasks
+
+
+class TestEpicNamePrePopulation:
+    @patch("quill.jira_client.JIRA")
+    def test_create_issue_includes_epic_name(self, mock_jira_class):
+        from quill.jira_client import JiraClient
+        mock_jira = MagicMock()
+        mock_jira.fields.return_value = [{"name": "Epic Name", "id": "customfield_10011"}]
+        mock_jira_class.return_value = mock_jira
+        client = JiraClient("http://jira.test", "user", "pass")
+        client.jira = mock_jira
+
+        client.create_issue("PROJ", "Epic Summary", "Description", "Epic")
+        mock_jira.create_issue.assert_called_once()
+        called_fields = mock_jira.create_issue.call_args[1]["fields"]
+        assert called_fields["customfield_10011"] == "Epic Summary"
+
+    @patch("quill.jira_client.JIRA")
+    def test_update_issue_type_to_epic_includes_epic_name(self, mock_jira_class):
+        import types
+        from quill.jira_client import JiraClient
+        mock_jira = MagicMock()
+        mock_jira.fields.return_value = [{"name": "Epic Name", "id": "customfield_10011"}]
+        mock_issue = MagicMock()
+        mock_issue.fields = types.SimpleNamespace(issuetype=types.SimpleNamespace(name="Task"), summary="Existing Issue")
+        mock_jira.issue.return_value = mock_issue
+        mock_jira.issue_types.return_value = [types.SimpleNamespace(name="Epic", id="10000")]
+        mock_jira_class.return_value = mock_jira
+
+        client = JiraClient("http://jira.test", "user", "pass")
+        client.jira = mock_jira
+
+        client.update_issue_type("PROJ-1", "Epic")
+        mock_issue.update.assert_called_once()
+        called_fields = mock_issue.update.call_args[1]["fields"]
+        assert called_fields["issuetype"] == {"id": "10000", "name": "Epic"}
+        assert called_fields["customfield_10011"] == "Existing Issue"
+
+    @patch("quill.jira_client.JIRA")
+    def test_set_parent_issue_promote_to_epic_includes_epic_name(self, mock_jira_class):
+        import types
+        from quill.jira_client import JiraClient
+        mock_jira = MagicMock()
+        mock_jira.fields.return_value = [{"name": "Epic Name", "id": "customfield_10011"}]
+        mock_parent = MagicMock()
+        mock_parent.fields = types.SimpleNamespace(issuetype=types.SimpleNamespace(name="Task"), summary="Parent Task")
+        mock_child = MagicMock()
+        mock_child.fields = types.SimpleNamespace(issuetype=types.SimpleNamespace(name="Task"), parent=None)
+        mock_jira.issue.side_effect = lambda k: mock_parent if k == "PARENT-1" else mock_child
+        mock_jira_class.return_value = mock_jira
+
+        client = JiraClient("http://jira.test", "user", "pass")
+        client.jira = mock_jira
+
+        client.set_parent_issue("CHILD-1", "PARENT-1", promote_to_epic=True)
+        mock_parent.update.assert_called_once()
+        called_fields = mock_parent.update.call_args[1]["fields"]
+        assert called_fields["issuetype"] == {"name": "Epic"}
+        assert called_fields["customfield_10011"] == "Parent Task"
+
+    @patch("quill.jira_client.JIRA")
+    def test_update_issue_type_screen_retry_and_epic_name(self, mock_jira_class):
+        import types
+        from quill.jira_client import JiraClient
+        mock_jira = MagicMock()
+        mock_jira.fields.return_value = [{"name": "Epic Name", "id": "customfield_10004"}]
+        mock_issue = MagicMock()
+        mock_issue.fields = types.SimpleNamespace(issuetype=types.SimpleNamespace(name="Task"), summary="Existing Task")
+        mock_jira.issue.return_value = mock_issue
+        mock_jira.issue_types.return_value = [types.SimpleNamespace(name="Epic", id="10000")]
+        mock_jira_class.return_value = mock_jira
+
+        # First call with customfield_10004 fails due to screen restriction; second call without customfield_10004 succeeds
+        def update_side_effect(fields=None):
+            if fields and "customfield_10004" in fields and "issuetype" in fields:
+                raise Exception("Field 'customfield_10004' cannot be set. It is not on the appropriate screen, or unknown.")
+        mock_issue.update.side_effect = update_side_effect
+
+        client = JiraClient("http://jira.test", "user", "pass")
+        client.jira = mock_jira
+
+        res = client.update_issue_type("PROJ-2", "Epic")
+        assert res is True
+        assert mock_issue.update.call_count == 3
+        # Call 1: combined fields failed
+        # Call 2: issuetype only succeeded
+        # Call 3: set_epic_name succeeded
+
+    @patch("quill.jira_client.JIRA")
+    def test_update_issue_type_top_level_recreate_fallback(self, mock_jira_class):
+        import types
+        from quill.jira_client import JiraClient
+        mock_jira = MagicMock()
+        mock_jira.fields.return_value = [{"name": "Epic Name", "id": "customfield_10004"}]
+        mock_issue = MagicMock()
+        mock_issue.fields = types.SimpleNamespace(
+            issuetype=types.SimpleNamespace(name="Task"),
+            summary="Top level task",
+            description="",
+            project=types.SimpleNamespace(key="GITHUB"),
+            labels=[],
+            duedate=None,
+        )
+        mock_jira.issue.return_value = mock_issue
+        mock_jira.issue_types.return_value = [types.SimpleNamespace(name="Epic", id="10000")]
+        mock_issue.update.side_effect = Exception("Cannot change issue type in-place")
+        mock_jira_class.return_value = mock_jira
+
+        client = JiraClient("http://jira.test", "user", "pass")
+        client.jira = mock_jira
+        with patch.object(client, "recreate_as_standard_issue", return_value="GITHUB-999") as mock_recreate:
+            res = client.update_issue_type("GITHUB-355", "Epic")
+            assert res == "GITHUB-999"
+            mock_recreate.assert_called_once_with(
+                old_issue_key="GITHUB-355",
+                new_type="Epic",
+                parent_key=None,
+                github_link_field=None,
+            )
+
+
+class TestSyncHierarchyGuard:
+    def test_classify_hierarchy_levels_title_epic(self):
+        import types
+        from quill.sync import SyncEngine
+
+        issues = [
+            types.SimpleNamespace(number=1, title="[Epic] Viper roadmap", labels=[]),
+            types.SimpleNamespace(number=2, title="Epic: XRadio integration", labels=[]),
+            types.SimpleNamespace(number=3, title="Regular task", labels=[]),
+        ]
+        level1, level2, level3 = SyncEngine._classify_hierarchy_levels(issues, repo_parents=None)
+        assert 1 in level1
+        assert 2 in level1
+        assert 3 in level2
+
+    @patch("quill.jira_client.JIRA")
+    def test_sync_issue_skips_demote_epic_to_task(self, mock_jira_class):
+        import types
+        from quill.jira_client import JiraClient
+        from quill.sync import SyncEngine
+
+        mock_jira = MagicMock()
+        mock_jira_issue = MagicMock()
+        mock_jira_issue.key = "GITHUB-355"
+        mock_jira_issue.fields = types.SimpleNamespace(issuetype=types.SimpleNamespace(name="Epic"), summary="Viper refactor")
+        mock_jira_issue._quill_cached_hash = "cached-hash"
+        mock_jira.issue.return_value = mock_jira_issue
+        mock_jira_class.return_value = mock_jira
+
+        client = JiraClient("http://jira.test", "user", "pass")
+        client.jira = mock_jira
+
+        cfg = MagicMock()
+        cfg.github_token = "fake-token"
+        cfg.jira_default_issue_type = "Task"
+        engine = SyncEngine(cfg)
+        engine.jira_client = client
+
+        rc = MagicMock()
+        rc.project_key = "GITHUB"
+        rc.issue_type = "Task"
+        rc.epic_link_field = None
+
+        mock_created = MagicMock()
+        mock_created.strftime.return_value = "2026-07-14"
+        gh_issue = types.SimpleNamespace(number=355, title="Viper refactor", body="", state="open", labels=[], html_url="https://github.com/test/repo/issues/355", comments=0, created_at=mock_created, user=types.SimpleNamespace(login="testuser"))
+        with patch.object(client, "update_issue_type") as mock_update_type:
+            engine._sync_issue(rc, gh_issue, lookup={"https://github.com/test/repo/issues/355": mock_jira_issue}, dry_run=False, force=False, stats={"created": 0, "updated": 0, "skipped": 0, "errors": 0}, level2_tasks={355})
+            # Because GITHUB-355 is currently an Epic and target is Task with no parent, demotion MUST be skipped!
+            mock_update_type.assert_not_called()

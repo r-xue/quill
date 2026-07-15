@@ -317,17 +317,24 @@ class SyncEngine:
         level2_tasks: set[int] = set()
         level3_subtasks: set[int] = set()
 
+        def _is_explicit_epic(issue_obj: Any, issue_num: int) -> bool:
+            labels = [getattr(lbl, "name", str(lbl)) for lbl in getattr(issue_obj, "labels", [])]
+            if any(lbl.lower() == "epic" for lbl in labels):
+                return True
+            title = getattr(issue_obj, "title", str(issue_obj))
+            if re.search(r"^\s*\[?epic\]?:?|\s*\[epic\]|^\s*epic\s*[:\-]", title, re.IGNORECASE):
+                return True
+            if repo_project_fields and issue_num in repo_project_fields:
+                for k, v in repo_project_fields[issue_num].items():
+                    if k.lower() in ("type", "issue type", "kind") and str(v).lower() == "epic":
+                        return True
+            return False
+
         if not repo_parents:
-            # If there's no parent hierarchy, check for explicit Epic labels/fields or default to Task
+            # If there's no parent hierarchy, check for explicit Epic labels/fields/titles or default to Task
             for issue in gh_issues:
                 num = issue.number
-                labels = [getattr(lbl, "name", str(lbl)) for lbl in getattr(issue, "labels", [])]
-                if any(lbl.lower() == "epic" for lbl in labels):
-                    level1_epics.add(num)
-                elif repo_project_fields and num in repo_project_fields and any(
-                    k.lower() in ("type", "issue type", "kind") and str(v).lower() == "epic"
-                    for k, v in repo_project_fields[num].items()
-                ):
+                if _is_explicit_epic(issue, num):
                     level1_epics.add(num)
                 else:
                     level2_tasks.add(num)
@@ -353,23 +360,16 @@ class SyncEngine:
 
         # Pass 1: Identify Level 1 Epics
         # An issue is classified as a Level 1 Epic if:
-        # 1. It explicitly has an 'epic' label or project field
+        # 1. It explicitly has an 'epic' label, project field, or '[Epic]' / 'Epic:' in title
         # 2. It has children and no parent inside the repository (root container)
         # 3. It has children AND any of its children also have children (i.e. depth >= 3 tree where this node is the container)
         for issue in gh_issues:
             num = issue.number
             has_parent = num in child_numbers
             has_children = num in parent_numbers
+            is_explicit = _is_explicit_epic(issue, num)
 
-            labels = [getattr(lbl, "name", str(lbl)) for lbl in getattr(issue, "labels", [])]
-            is_explicit_epic = any(lbl.lower() == "epic" for lbl in labels)
-            if not is_explicit_epic and repo_project_fields and num in repo_project_fields:
-                for k, v in repo_project_fields[num].items():
-                    if k.lower() in ("type", "issue type", "kind") and str(v).lower() == "epic":
-                        is_explicit_epic = True
-                        break
-
-            if is_explicit_epic or (has_children and not has_parent):
+            if is_explicit or (has_children and not has_parent):
                 level1_epics.add(num)
             elif has_children and any(c in parent_numbers for c in children_by_parent.get(num, set())):
                 level1_epics.add(num)
@@ -398,7 +398,7 @@ class SyncEngine:
                 # If this node itself has children (and parent wasn't Level 1 Epic), treat as Level 2 Task
                 # and promote parent to Level 1 Epic so all siblings are at Level 2 Tasks
                 level2_tasks.add(num)
-                if p_num != -1:
+                if p_num != -1 and p_num not in child_numbers:
                     level1_epics.add(p_num)
                     # Also move any already-processed siblings under p_num from level3_subtasks to level2_tasks
                     for sibling in children_by_parent.get(p_num, set()):
@@ -617,7 +617,9 @@ class SyncEngine:
             curr_issue_type = getattr(getattr(jira_issue.fields, "issuetype", None), "name", "")
             if curr_issue_type and target_issue_type and curr_issue_type.lower() != target_issue_type.lower():
                 is_target_subtask = "sub-task" in target_issue_type.lower() or "subtask" in target_issue_type.lower()
-                if not (is_target_subtask and not parent_jira_key_for_create):
+                if curr_issue_type.lower() == "epic" and target_issue_type.lower() == "task" and not parent_jira_key_for_migration and not parent_jira_key_for_create:
+                    logger.debug(f"Issue {jira_key} is currently an Epic without parent; skipping demotion to Task to preserve hierarchy container.")
+                elif not (is_target_subtask and not parent_jira_key_for_create):
                     if not dry_run:
                         res_type = self.jira_client.update_issue_type(jira_key, target_issue_type, parent_key=parent_jira_key_for_migration or parent_jira_key_for_create)
                         if isinstance(res_type, str):
@@ -745,7 +747,7 @@ class SyncEngine:
                 promote_flag = True
                 clean_p = re.sub(r"[^0-9]", "", parent_ref.split("/")[-1] if "/" in parent_ref else parent_ref)
                 p_num = int(clean_p) if clean_p and clean_p.isdigit() else -1
-                if (level3_subtasks and issue.number in level3_subtasks) or (level2_tasks and p_num in level2_tasks):
+                if (level3_subtasks and issue.number in level3_subtasks) or (level2_tasks and p_num in level2_tasks) or (p_num != -1 and p_num in repo_parents):
                     promote_flag = False
                 if pending_parent_links is not None:
                     if stats_lock:
