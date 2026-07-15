@@ -426,3 +426,140 @@ class TestSyncHierarchyGuard:
             engine._sync_issue(rc, gh_issue, lookup={"https://github.com/test/repo/issues/355": mock_jira_issue}, dry_run=False, force=False, stats={"created": 0, "updated": 0, "skipped": 0, "errors": 0}, level2_tasks={355})
             # Because GITHUB-355 is currently an Epic and target is Task with no parent, demotion MUST be skipped!
             mock_update_type.assert_not_called()
+
+
+class TestRemoteLinkSync:
+    @patch("quill.jira_client.JIRA")
+    def test_sync_issue_skips_remote_link_when_unchanged(self, mock_jira_class):
+        """When an existing issue has unchanged description/hash (`skipped`), no network calls are made."""
+        import types
+        from quill.jira_client import JiraClient
+        from quill.sync import SyncEngine
+
+        mock_jira = MagicMock()
+        mock_jira_issue = MagicMock()
+        mock_jira_issue.key = "GITHUB-999"
+        mock_jira_issue.fields = types.SimpleNamespace(issuetype=types.SimpleNamespace(name="Task"), summary="Subtask item")
+        mock_jira_issue._quill_cached_hash = "same-hash"
+        mock_jira.issue.return_value = mock_jira_issue
+        mock_jira_class.return_value = mock_jira
+
+        client = JiraClient("http://jira.test", "user", "pass")
+        client.jira = mock_jira
+
+        cfg = MagicMock()
+        cfg.github_token = "fake-token"
+        cfg.jira_default_issue_type = "Task"
+        cfg.jira_github_link_field = "customfield_10200"
+        engine = SyncEngine(cfg)
+        engine.jira_client = client
+
+        rc = MagicMock()
+        rc.project_key = "GITHUB"
+        rc.full_name = "test/repo"
+        rc.issue_type = "Task"
+
+        mock_created = MagicMock()
+        mock_created.strftime.return_value = "2026-07-14"
+        gh_issue = types.SimpleNamespace(
+            number=999,
+            title="Subtask item",
+            body="",
+            state="open",
+            labels=[],
+            html_url="https://github.com/test/repo/issues/999",
+            comments=0,
+            created_at=mock_created,
+            user=types.SimpleNamespace(login="testuser")
+        )
+
+        stats = {"created": 0, "updated": 0, "skipped": 0, "errors": 0}
+        with patch("quill.sync.compute_content_hash", return_value="same-hash"), \
+             patch("quill.sync.extract_hash_footer", return_value="same-hash"), \
+             patch("quill.sync.embed_hash_footer", return_value="desc\n\n[quill-hash: same-hash]"), \
+             patch.object(client, "add_remote_link") as mock_rl, \
+             patch.object(client, "set_custom_field") as mock_scf:
+            engine._sync_issue(
+                rc,
+                gh_issue,
+                lookup={"https://github.com/test/repo/issues/999": mock_jira_issue},
+                dry_run=False,
+                force=False,
+                stats=stats,
+            )
+            mock_rl.assert_not_called()
+            mock_scf.assert_not_called()
+            assert stats["skipped"] == 1
+
+    @patch("quill.jira_client.JIRA")
+    def test_add_remote_link_skips_when_link_already_exists(self, mock_jira_class):
+        """Verify JiraClient.add_remote_link inspects existing remote links and skips duplicate creation."""
+        import types
+        from quill.jira_client import JiraClient
+
+        mock_jira = MagicMock()
+        existing_link = MagicMock()
+        existing_link.object = types.SimpleNamespace(url="https://github.com/test/repo/issues/999/")
+        mock_jira.remote_links.return_value = [existing_link]
+        mock_jira_class.return_value = mock_jira
+
+        client = JiraClient("http://jira.test", "user", "pass")
+        client.jira = mock_jira
+
+        client.add_remote_link("GITHUB-999", "https://github.com/test/repo/issues/999", "test/repo#999")
+        mock_jira.add_remote_link.assert_not_called()
+
+    @patch("quill.jira_client.JIRA")
+    def test_add_remote_link_creates_when_missing(self, mock_jira_class):
+        """Verify JiraClient.add_remote_link creates link if not present on issue."""
+        from quill.jira_client import JiraClient
+
+        mock_jira = MagicMock()
+        mock_jira.remote_links.return_value = []
+        mock_jira_class.return_value = mock_jira
+
+        client = JiraClient("http://jira.test", "user", "pass")
+        client.jira = mock_jira
+
+        client.add_remote_link("GITHUB-999", "https://github.com/test/repo/issues/999", "test/repo#999")
+        mock_jira.add_remote_link.assert_called_once_with(
+            "GITHUB-999",
+            destination={
+                "url": "https://github.com/test/repo/issues/999",
+                "title": "test/repo#999",
+                "icon": {
+                    "url16x16": "https://github.com/favicon.ico",
+                    "title": "GitHub",
+                },
+            },
+            globalId="quill=https://github.com/test/repo/issues/999",
+            relationship="GitHub Issue",
+        )
+
+    @patch("quill.jira_client.JIRA")
+    def test_add_remote_link_deletes_redundant_duplicates_from_jira(self, mock_jira_class):
+        """Verify JiraClient.add_remote_link actively purges duplicate remote links on Jira if more than one exists."""
+        import types
+        from quill.jira_client import JiraClient
+
+        mock_jira = MagicMock()
+        link1 = MagicMock()
+        link1.object = types.SimpleNamespace(url="https://github.com/test/repo/issues/999")
+        link2 = MagicMock()
+        link2.object = types.SimpleNamespace(url="https://github.com/test/repo/issues/999")
+        link3 = MagicMock()
+        link3.object = types.SimpleNamespace(url="https://github.com/test/repo/issues/999")
+
+        mock_jira.remote_links.return_value = [link1, link2, link3]
+        mock_jira_class.return_value = mock_jira
+
+        client = JiraClient("http://jira.test", "user", "pass")
+        client.jira = mock_jira
+
+        client.add_remote_link("GITHUB-999", "https://github.com/test/repo/issues/999", "test/repo#999")
+        # Ensure new creation was skipped since link1 exists
+        mock_jira.add_remote_link.assert_not_called()
+        # Ensure redundant duplicates (link2 and link3) were actively deleted from Jira
+        link1.delete.assert_not_called()
+        link2.delete.assert_called_once()
+        link3.delete.assert_called_once()

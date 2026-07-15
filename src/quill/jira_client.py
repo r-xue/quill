@@ -812,6 +812,9 @@ class JiraClient:
         description: str,
         labels: Optional[list[str]] = None,
         due_date: Optional[str] = None,
+        github_link_field: Optional[str] = None,
+        github_url: Optional[str] = None,
+        github_title: Optional[str] = None,
     ):
         """
         Update an existing Jira issue's summary, description, and labels.
@@ -833,6 +836,20 @@ class JiraClient:
         if due_date:
             self.set_due_date(issue_key, due_date)
 
+        if github_link_field and github_url:
+            self.set_custom_field(issue_key, github_link_field, github_url)
+
+        if github_url:
+            title_str = github_title or f"GitHub #{github_url.rstrip('/').split('/')[-1]}"
+            try:
+                self.add_remote_link(
+                    issue_key=issue_key,
+                    github_url=github_url,
+                    title=title_str,
+                )
+            except Exception as exc_rl:
+                logger.debug(f"Could not add remote link on {issue_key}: {exc_rl}")
+
     def set_parent_issue(
         self,
         issue_key: str,
@@ -849,7 +866,7 @@ class JiraClient:
         if issue_key == parent_key:
             return False
 
-        logger.info(f"Linking {issue_key} -> parent/epic {parent_key}…")
+        logger.debug(f"Checking parent/epic link for {issue_key} -> {parent_key}…")
         try:
             issue = self.jira.issue(issue_key)
         except Exception as exc:
@@ -859,6 +876,7 @@ class JiraClient:
         # Check if already linked via parent field
         curr_parent = getattr(issue.fields, "parent", None)
         if getattr(curr_parent, "key", None) == parent_key or str(curr_parent) == parent_key:
+            logger.debug(f"Issue {issue_key} is already linked to parent {parent_key} via 'parent' field.")
             return False
 
         # Check if already linked via epic link field
@@ -866,7 +884,10 @@ class JiraClient:
         if epic_field_id:
             curr_epic = getattr(issue.fields, epic_field_id, None)
             if getattr(curr_epic, "key", None) == parent_key or str(curr_epic) == parent_key:
+                logger.debug(f"Issue {issue_key} is already linked to epic {parent_key} via '{epic_link_field}'.")
                 return False
+
+        logger.info(f"Linking {issue_key} -> parent/epic {parent_key}…")
 
         # Check if parent is an Epic before linking; if not, attempt to promote it ONLY when promote_to_epic is True
         is_parent_epic = False
@@ -1045,9 +1066,34 @@ class JiraClient:
         Add a remote issue link pointing back to the GitHub issue.
 
         Shows up in the Jira UI as a native "Links" entry with the GitHub
-        favicon.  Uses ``globalId`` for idempotency — calling this twice
-        with the same URL will not create duplicates on Jira Data Center.
+        favicon. Pre-checks existing remote links to prevent duplicates and
+        actively cleans up any redundant duplicate web links already present.
         """
+        try:
+            existing_matches = []
+            for link in self.jira.remote_links(issue_key):
+                obj_url = getattr(getattr(link, "object", None), "url", None)
+                if not obj_url and hasattr(link, "raw") and isinstance(getattr(link, "raw", None), dict):
+                    obj_dict = link.raw.get("object")
+                    if isinstance(obj_dict, dict):
+                        obj_url = obj_dict.get("url")
+                if obj_url and obj_url.rstrip("/") == github_url.rstrip("/"):
+                    existing_matches.append(link)
+
+            if existing_matches:
+                if len(existing_matches) > 1:
+                    logger.info(f"Found {len(existing_matches)} duplicate remote links for {github_url} on {issue_key}. Cleaning up redundant copies…")
+                    for dup_link in existing_matches[1:]:
+                        try:
+                            if hasattr(dup_link, "delete"):
+                                dup_link.delete()
+                        except Exception as exc_del:
+                            logger.debug(f"Could not delete duplicate remote link {getattr(dup_link, 'id', 'unknown')} on {issue_key}: {exc_del}")
+                logger.debug(f"Remote link for {github_url} already exists on {issue_key}. Skipping creation.")
+                return
+        except Exception as exc:
+            logger.debug(f"Could not inspect existing remote links on {issue_key}: {exc}")
+
         logger.info(f"Adding remote link to {issue_key} → {github_url}")
         self.jira.add_remote_link(
             issue_key,

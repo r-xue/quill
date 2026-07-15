@@ -635,6 +635,17 @@ class SyncEngine:
                                         lookup[gh_url] = types.SimpleNamespace(key=jira_key)
                                 else:
                                     lookup[gh_url] = types.SimpleNamespace(key=jira_key)
+                        if res_type and gh_url:
+                            try:
+                                self.jira_client.add_remote_link(
+                                    issue_key=jira_key,
+                                    github_url=gh_url,
+                                    title=f"{rc.full_name}#{issue.number}",
+                                )
+                            except Exception as exc_rl:
+                                logger.debug(f"Could not add remote link on migrated {jira_key}: {exc_rl}")
+                            if github_link_field:
+                                self.jira_client.set_custom_field(jira_key, github_link_field, gh_url)
                     else:
                         logger.info(f"[Dry Run] Would migrate {jira_key} issue type from '{curr_issue_type}' to '{target_issue_type}'")
 
@@ -680,6 +691,9 @@ class SyncEngine:
                         description=jira_description,
                         labels=merged_labels,
                         due_date=due_date_str,
+                        github_link_field=github_link_field,
+                        github_url=gh_url,
+                        github_title=f"{rc.full_name}#{issue.number}",
                     )
                     self.jira_client.set_issue_property(
                         jira_key, "quill-content-hash", current_hash
