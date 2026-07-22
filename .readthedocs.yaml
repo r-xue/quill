@@ -8,12 +8,8 @@ build:
   tools:
     python: '3.12'
 
-sphinx:
-  configuration: docs/conf.py
-
-python:
-  install:
-    - method: pip
-      path: .
-      extra_requirements:
-        - docs
+  commands:
+    - pip install -e .[docs]
+    - zensical build
+    - mkdir -p $READTHEDOCS_OUTPUT/html/
+    - cp -a site/. $READTHEDOCS_OUTPUT/html/

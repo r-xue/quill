@@ -122,7 +122,8 @@ This means:
 | Action | Required Permission |
 |---|---|
 | Create the custom field | Jira Administrator |
-| Use quill to sync | Jira PAT with project write access |
+| Use quill to sync | Jira PAT with project write access (`Create Issues`, `Edit Issues`) |
+| Set Due Dates on issues | Jira PAT with **Schedule Issues** permission + **Due Date** field enabled on the project's Edit screen |
 | Read GitHub issues | GitHub PAT with `public_repo` scope (or none for public repos, but rate-limited) |
 
 ---
@@ -144,3 +145,12 @@ Quill relies on the `github_link_field` containing the exact GitHub issue URL. I
 ### Can I use a Text field instead of a URL field?
 
 Yes. A single-line text field works fine. The URL type is slightly nicer because Jira renders it as a clickable link, but functionally both work the same way.
+
+### Why do I see a warning: `Could not set duedate on ... Field 'duedate' cannot be set`?
+
+When setting a due date via the REST edit endpoint (`PUT /rest/api/2/issue/{key}`), Jira requires two things:
+
+1. **Screen Configuration**: The **Due Date** field must be explicitly added to the **Edit Issue Screen** associated with your project and issue type.
+2. **Project Permission**: The user/PAT performing the sync (`gh_mirror_admin`) must have the **Schedule Issues** project permission.
+
+If either requirement is missing, Jira returns HTTP 400. To resolve this, ask a Jira project admin to add the **Due Date** field to the project's edit screen and grant the **Schedule Issues** permission to the service account. Note that this warning is non-fatal—quill still creates and updates the rest of the issue fields.

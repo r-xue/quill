@@ -28,10 +28,7 @@ dev = [
     "pytest-mock>=3.0.0",
 ]
 docs = [
-    "sphinx>=7.0",
-    "furo",
-    "myst-parser>=3.0",
-    "sphinx-autodoc-typehints",
+    "zensical",
 ]
 
 [project.scripts]
@@ -61,13 +58,10 @@ pytest-mock = ">=3.0.0"
 
 [tool.pixi.pypi-dependencies]
 quill-sync = { path = ".", editable = true }
-sphinx = ">=7.0"
-furo = "*"
-myst-parser = ">=3.0"
-sphinx-autodoc-typehints = "*"
+zensical = "*"
 
 [tool.pixi.tasks]
-docs = { cmd = "sphinx-build -b html docs docs/_build/html", description = "Build Sphinx documentation" }
+docs = { cmd = "zensical build", description = "Build documentation with Zensical" }
 check = "quill check"
 sync = "quill sync"
 status = "quill status"
