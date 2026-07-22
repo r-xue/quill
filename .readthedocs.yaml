@@ -11,4 +11,5 @@ build:
   commands:
     - pip install -e .[docs]
     - zensical build
-    - cp -a site/ $READTHEDOCS_OUTPUT/html/
+    - mkdir -p $READTHEDOCS_OUTPUT/html/
+    - cp -a site/. $READTHEDOCS_OUTPUT/html/
