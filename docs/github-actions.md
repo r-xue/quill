@@ -114,3 +114,48 @@ GitHub Actions provides built-in monitoring:
 - **Logs**: Full logs of each sync run are available in the Actions UI.
 
 For additional monitoring, you can add a step to post a summary to Slack or Teams after the sync completes.
+
+---
+
+## Centralized Hub Architecture (`quill-automation`)
+
+If you want to keep your target software repositories (e.g., `your-org/target-repo`) clean without adding synchronization workflows or `quill.toml` configs to every repository, we strongly recommend adopting the **Centralized Hub Repository** pattern.
+
+### Setup Steps:
+
+1. **Create a Dedicated Automation Repository**: Create a repository (e.g., `your-org/quill-automation`) containing only your central `quill.toml` and `.github/workflows/sync.yml`.
+2. **Configure Central Secrets**: Store your credentials in this repository's GitHub Secrets (`JIRA_SERVER`, `JIRA_TOKEN`, `GH_PAT`).
+3. **Workflow Example (`.github/workflows/sync.yml`)**:
+   ```yaml
+   name: Centralized Jira Issue Sync
+
+   on:
+     schedule:
+       - cron: '0 * * * *'        # Run hourly at minute 0
+     workflow_dispatch:           # Manual UI trigger
+
+   jobs:
+     sync:
+       runs-on: ubuntu-latest     # Or self-hosted runner if Jira is internal
+       steps:
+         - name: Checkout automation hub repository
+           uses: actions/checkout@v4
+
+         - name: Set up Python
+           uses: actions/setup-python@v5
+           with:
+             python-version: '3.12'
+
+         - name: Install Quill Sync
+           run: pip install git+https://github.com/r-xue/quill.git
+
+         - name: Run Centralized Synchronization
+           env:
+             QUILL_JIRA_SERVER: ${{ secrets.JIRA_SERVER }}
+             QUILL_JIRA_TOKEN: ${{ secrets.JIRA_TOKEN }}
+             QUILL_GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+           run: |
+             quill sync
+   ```
+
+By using this architecture, target software repositories remain completely unpolluted, security secrets are isolated to one central hub repo, and onboarding new repositories requires only adding lines to a single centralized `quill.toml`.

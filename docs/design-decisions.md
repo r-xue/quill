@@ -78,7 +78,7 @@ quill exists because:
 
 ## 1. Stateless Architecture (No Local Database)
 
-**Decision**: Store sync state in Jira itself (custom field + content hash footer) instead of a local database.
+**Decision**: Store sync state in Jira itself (custom field + entity properties) instead of a local database.
 
 **Alternatives considered**:
 
@@ -87,30 +87,47 @@ quill exists because:
 | **SQLite state file** (v1) | Fast lookups, simple queries | Must persist between runs; CI/CD nightmare (needs `actions/cache`); multi-machine conflicts; file can be lost or corrupted |
 | **Git-committed state** | Versioned, survives reinstalls | Pollutes commit history; merge conflicts; grows with issue count |
 | **Redis/external DB** | Fast, shared, queryable | Over-engineered for this use case; adds infrastructure dependency |
-| **Jira custom field + JQL** (chosen) | Zero local state; CI/CD native; multi-machine safe; survives reinstalls | Requires one-time Jira admin setup; slightly more API calls per run |
+| **Jira custom field + entity properties** (chosen) | Zero local state; CI/CD native; multi-machine safe; survives reinstalls | Requires one-time Jira admin setup for custom field |
 
 **Why we switched**: quill v1 used SQLite. It worked locally but broke in GitHub Actions because runners are ephemeral — the state file was lost between runs. Caching hacks (`actions/cache`, artifact uploads) were fragile. The stateless design eliminates the problem entirely.
 
 ---
 
-## 2. Change Detection via Content Hash Footer
+## 2. Change Detection via Pre-fetched Entity Properties
 
-**Decision**: Embed a `<!-- quill:sha256:... -->` HTML comment in the Jira description for change detection.
+**Decision**: Store the SHA256 content hash in Jira issue entity properties (`quill-content-hash`) and pre-fetch it via the `properties` parameter during batch JQL lookups.
 
-**Alternatives considered**:
+**Evolution & Alternatives considered**:
 
 | Approach | Pros | Cons |
 |---|---|---|
 | **Full-text diff** | Detects any change | Expensive; Markdown→Jira conversion is lossy, so round-trip comparison breaks |
 | **`updated_at` timestamp** | Simple | Requires storing "last synced at" somewhere (back to state problem); GitHub timestamps change on label edits too |
-| **Jira custom field for hash** | Clean separation | Wastes another custom field; still need admin setup |
-| **HTML comment in description** (chosen) | Invisible in Jira UI; no extra fields needed; self-contained | Could be accidentally deleted by editing the description |
+| **HTML comment footer in description** (v10) | No extra API calls; self-contained | While hidden in basic wiki rendering, the comment `<!-- quill:sha256:... -->` leaked into external presentation layers (e.g. mirror projects, markdown presentation boards) |
+| **Pre-fetched entity properties** (chosen in v11) | Completely clean issue description; 100% invisible to users in all presentation layers; **zero extra HTTP calls** when pre-fetched via `search_issues(properties=...)` | Requires passing `properties` parameter to Jira REST search API |
 
-**Why this approach**: HTML comments are not rendered in Jira's wiki markup view, so the hash is invisible to users. It's self-contained — no extra infrastructure needed. SHA256 of (title, body, state, labels) gives reliable change detection with virtually zero false positives.
+**Why this approach**: In earlier versions (v10), quill embedded `<!-- quill:sha256:... -->` as an HTML comment in the Jira description. However, users viewing tickets in markdown mirror boards or external presentation tools could see the plain text comment. By storing the hash in Jira issue entity properties (`quill-content-hash`) and requesting `properties="quill-content-hash,quill-github-url"` during the batch JQL query (`search_issues`), quill achieves exact change detection with **zero additional HTTP calls** and leaves the Jira description completely clean.
 
 ---
 
-## 3. python-jira over atlassian-python-api
+## 3. Navigating Issue Hierarchy Mismatches
+
+GitHub's issue-tracking capabilities support flexibly deep parent-child relationships (e.g., issues containing sub-issues, which contain sub-sub-issues). Jira, conversely, enforces a strict 3-tier hierarchy: **Epic → Task → Subtask**.
+
+**Decision**: quill maps GitHub's flexible relationships into Jira's rigid 3-tier system. However, this fundamental architectural mismatch introduces several inherent quirks and operational limitations:
+
+1. **Hierarchy Depth Limitations**: Because Jira natively supports only three tiers, GitHub issue relationships that are four or more levels deep cannot be perfectly translated. Deeper nesting will inevitably be flattened, truncated, or presented inaccurately on the Jira side. Teams are encouraged to restrict their GitHub hierarchies to a maximum of three layers to maintain 1:1 parity.
+
+2. **Structural Rigidity & Ticket Regeneration**: The Jira REST API does not allow in-place promotion or demotion of issue types across architectural boundaries (e.g., you cannot trivially update a Task to become a Subtask via standard field edits; it often requires a specialized conversion process or recreation). If a parent-child relationship changes significantly in GitHub (such as demoting a standalone issue into a sub-issue), the sync tool may be forced to delete and regenerate the Jira ticket to satisfy Jira's structural constraints.
+   - **Warning**: This regeneration process assigns a new Jira issue key and could lead to the loss of Jira-exclusive metadata (like recent sprint assignments or manual edits). Users should minimize shuffling parent-child relationships in GitHub after they have been synced.
+
+3. **Inferred Relationships**: A two-layer hierarchy in GitHub could logically map to either `Epic → Task` or `Task → Subtask`. The automation must rely on specific heuristics (like looking for "Epic" headers or analyzing the tip of the hierarchy tree) to determine the correct Jira issue types. This inference can occasionally lead to ambiguity.
+
+4. **Label Propagation**: Labels applied to a top-level parent issue in GitHub are generally translated to the corresponding Epic in Jira, but they are not automatically propagated down to the child Tasks or Subtasks. This can impact filtering and visibility on Jira Scrum/Kanban boards if those boards rely heavily on task-level label queries.
+
+---
+
+## 4. python-jira over atlassian-python-api
 
 **Decision**: Use [python-jira](https://github.com/pycontribs/jira) (`jira` package) as the Jira client library.
 
@@ -126,7 +143,7 @@ quill exists because:
 
 ---
 
-## 4. PyGithub over github3.py and ghapi
+## 5. PyGithub over github3.py and ghapi
 
 **Decision**: Use [PyGithub](https://github.com/PyGithub/PyGithub) for GitHub API access.
 
@@ -143,7 +160,7 @@ quill exists because:
 
 ---
 
-## 5. pydantic-settings for Configuration
+## 6. pydantic-settings for Configuration
 
 **Decision**: Use [pydantic-settings](https://docs.pydantic.dev/latest/concepts/pydantic_settings/) with a 4-layer hierarchical configuration.
 
@@ -174,7 +191,7 @@ quill exists because:
 
 ---
 
-## 6. TOML over YAML
+## 7. TOML over YAML
 
 **Decision**: Use TOML for configuration files instead of YAML.
 
@@ -189,7 +206,7 @@ quill exists because:
 
 ---
 
-## 7. argparse over click
+## 8. argparse over click
 
 **Decision**: Use stdlib `argparse` instead of `click` for the CLI.
 
@@ -203,7 +220,7 @@ quill exists because:
 
 ---
 
-## 8. Rich for Terminal Output
+## 9. Rich for Terminal Output
 
 **Decision**: Use [Rich](https://github.com/Textualize/rich) for logging and terminal output.
 
@@ -217,7 +234,7 @@ quill exists because:
 
 ---
 
-## 9. Built-in Markdown Converter over pandoc
+## 10. Built-in Markdown Converter over pandoc
 
 **Decision**: Use a custom regex-based Markdown → Jira wiki markup converter instead of an external tool.
 
@@ -232,7 +249,7 @@ quill exists because:
 
 ---
 
-## 10. Pixi for Environment Management
+## 11. Pixi for Environment Management
 
 **Decision**: Use [Pixi](https://pixi.sh/) for Python environment and task management.
 
@@ -247,7 +264,7 @@ quill exists because:
 
 ---
 
-## 11. One-Way Sync (GitHub → Jira)
+## 12. One-Way Sync (GitHub → Jira)
 
 **Decision**: Sync is strictly one-directional. GitHub is the source of truth.
 

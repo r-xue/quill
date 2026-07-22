@@ -13,7 +13,7 @@ Get `quill` running in 5 minutes.
 ## 1. Clone & Install
 
 ```bash
-git clone https://github.com/your-org/quill.git
+git clone https://github.com/r-xue/quill.git
 cd quill
 pixi install
 ```
