@@ -536,10 +536,28 @@ class JiraClient:
                 logger.warning(f"Could not migrate issue type for {issue_key} to '{new_type}': {err_msg}")
             return False
 
+    def _unlink_epic_children(self, epic_key: str) -> None:
+        """Find all issues linked to this Epic and remove the Epic Link to allow deletion."""
+        try:
+            epic_field_id = self._discover_epic_link_field(default="")
+            if not epic_field_id:
+                return
+            children = self.jira.search_issues(f'"Epic Link" = {epic_key}', maxResults=100)
+            for child in children:
+                try:
+                    child.update(fields={epic_field_id: None})
+                    logger.debug(f"Unlinked child {child.key} from Epic {epic_key} prior to deletion.")
+                except Exception as e:
+                    logger.debug(f"Failed to unlink {child.key} from Epic {epic_key}: {e}")
+        except Exception as e:
+            logger.debug(f"Failed to search for Epic Link children for {epic_key}: {e}")
+
     def delete_issue(self, issue_key: str, delete_subtasks: bool = True) -> bool:
         """Permanently delete an existing Jira issue along with its sub-tasks."""
         try:
             issue = self.jira.issue(issue_key)
+            if getattr(getattr(issue.fields, "issuetype", None), "name", "").lower() == "epic":
+                self._unlink_epic_children(issue_key)
             issue.delete(deleteSubtasks=delete_subtasks)
             logger.info(f"Deleted stale/legacy Jira issue {issue_key}")
             return True
@@ -609,6 +627,8 @@ class JiraClient:
 
             # Delete the stale ticket rather than archiving
             try:
+                if getattr(getattr(old_issue.fields, "issuetype", None), "name", "").lower() == "epic":
+                    self._unlink_epic_children(old_issue_key)
                 old_issue.delete(deleteSubtasks=True)
                 logger.info(f"Successfully re-created {old_issue_key} -> {new_key} and deleted stale top-level ticket.")
             except Exception as exc_del:
@@ -695,8 +715,10 @@ class JiraClient:
 
             # Delete the stale sub-task
             try:
+                if getattr(getattr(old_issue.fields, "issuetype", None), "name", "").lower() == "epic":
+                    self._unlink_epic_children(old_issue_key)
                 old_issue.delete(deleteSubtasks=True)
-                logger.info(f"Successfully re-created {old_issue_key} -> {new_key} and deleted stale sub-task.")
+                logger.info(f"Successfully re-created {old_issue_key} -> {new_key} and deleted stale ticket.")
             except Exception as exc_del:
                 logger.warning(f"Re-created {new_key}, but could not delete stale sub-task {old_issue_key}: {exc_del}")
 
