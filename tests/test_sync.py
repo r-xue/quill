@@ -302,7 +302,7 @@ class TestEpicNamePrePopulation:
         mock_parent = MagicMock()
         mock_parent.fields = types.SimpleNamespace(issuetype=types.SimpleNamespace(name="Task"), summary="Parent Task")
         mock_child = MagicMock()
-        mock_child.fields = types.SimpleNamespace(issuetype=types.SimpleNamespace(name="Task"), parent=None)
+        mock_child.fields = types.SimpleNamespace(issuetype=types.SimpleNamespace(name="Sub-task"), parent=None)
         mock_jira.issue.side_effect = lambda k: mock_parent if k == "PARENT-1" else mock_child
         mock_jira_class.return_value = mock_jira
 
