@@ -617,8 +617,11 @@ class SyncEngine:
             curr_issue_type = getattr(getattr(jira_issue.fields, "issuetype", None), "name", "")
             if curr_issue_type and target_issue_type and curr_issue_type.lower() != target_issue_type.lower():
                 is_target_subtask = "sub-task" in target_issue_type.lower() or "subtask" in target_issue_type.lower()
+                is_curr_subtask = "sub-task" in curr_issue_type.lower() or "subtask" in curr_issue_type.lower()
                 if curr_issue_type.lower() == "epic" and target_issue_type.lower() == "task" and not parent_jira_key_for_migration and not parent_jira_key_for_create:
                     logger.debug(f"Issue {jira_key} is currently an Epic without parent; skipping demotion to Task to preserve hierarchy container.")
+                elif is_curr_subtask and target_issue_type.lower() == "task" and parent_jira_key_for_migration:
+                    logger.debug(f"Issue {jira_key} is currently a Sub-task with a parent; skipping promotion to Task to preserve cross-repo hierarchy.")
                 elif not (is_target_subtask and not parent_jira_key_for_create):
                     if not dry_run:
                         res_type = self.jira_client.update_issue_type(jira_key, target_issue_type, parent_key=parent_jira_key_for_migration or parent_jira_key_for_create)
