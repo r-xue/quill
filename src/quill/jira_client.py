@@ -928,16 +928,11 @@ class JiraClient:
                 # Ensure its Epic Name custom field is populated cleanly
                 self.set_epic_name(parent_key, parent_summary)
             elif parent_type.lower() not in ("epic", "sub-task", "subtask") and child_type.lower() not in ("epic", "sub-task", "subtask"):
-                logger.info(f"Linking Task -> Task detected ({issue_key} -> {parent_key}). Demoting child {issue_key} to Sub-task…")
+                logger.info(f"Linking Task -> Task detected ({issue_key} -> {parent_key}). Attempting to demote child {issue_key} to Sub-task…")
                 subtask_type = self.discover_subtask_issue_type()
-                new_key = self.recreate_as_subtask(
-                    old_issue_key=issue_key,
-                    new_type=subtask_type,
-                    parent_key=parent_key,
-                    github_link_field=getattr(self, "_last_github_link_field", None)
-                )
-                if new_key:
-                    logger.info(f"Successfully demoted {issue_key} to Sub-task {new_key} under {parent_key}.")
+                res_demote = self.update_issue_type(issue_key, subtask_type, parent_key=parent_key)
+                if res_demote:
+                    logger.info(f"Successfully demoted {issue_key} to Sub-task under {parent_key}.")
                     return True
             elif promote_to_epic and parent_type.lower() not in ("sub-task", "subtask") and not has_native_parent and not has_epic_parent:
                 logger.info(f"Parent issue {parent_key} currently has issue type '{parent_type}' (not 'Epic'). Promoting to 'Epic' so Epic Link / Agile hierarchy works…")
